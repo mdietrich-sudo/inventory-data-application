@@ -4,7 +4,13 @@ Reads the prior-day ledger partition and the PO table via the Storage/Query API 
 returns rows as plain dicts keyed by schema_map column names. Pushdown-to-SQL of the
 rule logic is a later optimization (PLAN Phase 6); this first pass selects the
 partition and lets the Python engine evaluate, which is fine at prototype volumes.
+
+Auth: on Cloud Run this picks up the runtime service account via ADC automatically.
+Hosts with no GCP ADC (e.g. Azure Functions/Container Apps) instead supply the SA
+key as JSON via `google_service_account_json` (e.g. an Azure Key Vault secret surfaced
+as an env var) — see `settings.google_service_account_json`.
 """
+import json
 from typing import List, Dict, Optional
 
 from .base import DataSource
@@ -26,7 +32,14 @@ class BigQueryDataSource(DataSource):
             if not getattr(settings, req):
                 raise RuntimeError("DATA_SOURCE=bigquery requires %s in .env" % req.upper())
         self._bq = bigquery
-        self.client = bigquery.Client(project=settings.gcp_project)
+        credentials = None
+        if settings.google_service_account_json:
+            from google.oauth2 import service_account
+            info = json.loads(settings.google_service_account_json)
+            credentials = service_account.Credentials.from_service_account_info(
+                info, scopes=["https://www.googleapis.com/auth/bigquery"]
+            )
+        self.client = bigquery.Client(project=settings.gcp_project, credentials=credentials)
 
     def _q(self, table: str) -> str:
         return "`%s.%s.%s`" % (settings.gcp_project, settings.bq_dataset, table)

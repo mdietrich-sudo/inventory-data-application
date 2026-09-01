@@ -65,6 +65,10 @@ class Settings(BaseSettings):
     bq_catalog_dataset: str = "supply_chain_catalog"
     bq_products_table: str = "wonder_products"
     google_application_credentials: Optional[str] = None  # path to read-only SA key
+    # Raw SA key JSON (e.g. pulled from Azure Key Vault into an env var / App Setting) — used instead
+    # of a key *file* when the runtime has no GCP ADC available (Cloud Run does; Azure does not).
+    # If unset, falls back to google_application_credentials / ADC as before.
+    google_service_account_json: Optional[str] = None
     # ERP standard-cost source (Dynamics), cross-project; ITEMID = consumable_sku. See SCHEMA_NOTES.md.
     erp_project: str = "wonder-raw-prod"
     erp_dataset: str = "erp_prod_batch"
