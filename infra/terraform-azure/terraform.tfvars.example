@@ -1,0 +1,58 @@
+# Copy to terraform.tfvars and fill in. terraform.tfvars is gitignored.
+# Secrets (db_password, jira_api_token, google_service_account_json) go via env, NOT this file:
+#   export TF_VAR_db_password='...'
+#   export TF_VAR_jira_api_token='...'
+#   export TF_VAR_google_service_account_json="$(cat readonly-sa-key.json)"
+
+subscription_id       = "00000000-0000-0000-0000-000000000000"  # Pavel's team's subscription
+resource_group        = "wonder-dq-temp"                        # or the client's naming convention
+create_resource_group = true                                    # false = reuse an existing RG
+location              = "eastus"                                # match the client's other apps
+
+# Built from app/Dockerfile and pushed to the ACR this module creates (see `image_repository`
+# output). Chicken-and-egg on a first apply — see README step 3.
+image = "wonderdqab12.azurecr.io/wonder-dq/app:latest"
+
+# NO SSO this launch (GO-LIVE-AZURE.md §5.3/§6): true = the console URL is public, including
+# POST /api/run (which creates real Jira tickets).
+allow_unauthenticated = true
+# Interim alternative while SSO is unresolved: set allow_unauthenticated = false and list the
+# client's office/VPN egress CIDRs here (this narrows access; it is not authentication).
+# ingress_allowed_ip_ranges = [
+#   { name = "client-vpn", ip_address_range = "203.0.113.0/24" },
+# ]
+
+# Reuse the client's shared Container Apps Environment instead of a dedicated one (§1.5):
+# container_app_environment_id = "/subscriptions/.../managedEnvironments/shared-env"
+
+# BigQuery source (read-only; the data stays in GCP — only hosting moves to Azure)
+bq_project      = "wonder-dw-prod-brd"
+bq_dataset      = "inventory"
+bq_ledger_table = "consolidated_inventory_ledger"
+bq_po_table     = "int_ledger_purchase_orders"
+erp_bq_project  = "wonder-raw-prod"   # ERP standard-cost project (COST rules)
+erp_bq_dataset  = "erp_prod_batch"
+
+# Daily validation run (§7): "functions" (client's proposal) | "logicapp" (zero code) | "none"
+daily_run_trigger           = "functions"
+scheduler_hour              = 0        # 00:15 local — just after the prior data day closes
+scheduler_minute            = 15
+scheduler_time_zone         = "America/Los_Angeles"   # IANA, used by the Functions timer
+scheduler_time_zone_windows = "Pacific Standard Time" # Windows name, used by the Logic App
+
+# Jira — the CLIENT's Jira, not the dietrichcoding.atlassian.net sandbox (§2)
+jira_base_url    = "https://<client>.atlassian.net"
+jira_email       = "inventory-dq@<client>"
+jira_project_key = "WIQ"
+jira_issue_type  = "Task"
+# jira_done_transition   = "Done"             # verify against the client's workflow (§8.9)
+# jira_fingerprint_field = "customfield_10050"
+
+# Postgres — sandbox-shaped by default (§10). Add your workstation IP for one-off psql/alembic:
+# db_allowed_ip_ranges = [
+#   { name = "my-laptop", start_ip_address = "198.51.100.7", end_ip_address = "198.51.100.7" },
+# ]
+
+# db_password                 -> set via TF_VAR_db_password
+# jira_api_token              -> set via TF_VAR_jira_api_token
+# google_service_account_json -> set via TF_VAR_google_service_account_json

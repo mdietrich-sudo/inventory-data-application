@@ -38,9 +38,10 @@ Scoped to the **three constraints for this launch**, Azure-flavored:
    docs, **unless** §6 resolves in Entra ID's favor before go-live, in which case ship with Easy Auth on
    from day one instead of deferring it.
 
-> **Terraform status.** Like AWS, this is **not yet written** — this document is the design + task list.
-> §8 lists exactly what `infra/terraform-azure/` needs to contain (all `azurerm`-provider resources with
-> mature Terraform support).
+> **Terraform status.** **Written** — [`infra/terraform-azure/`](../infra/terraform-azure/) is the
+> `azurerm` port of the GCP module and is `terraform validate`-clean against the provider, but **not yet
+> applied** (needs a subscription + credentials). §8 tracks what it contains; its
+> [README](../infra/terraform-azure/README.md) has the apply order and the first-apply wrinkles.
 
 ---
 
@@ -56,7 +57,7 @@ Scoped to the **three constraints for this launch**, Azure-flavored:
 | Daily run trigger | Cloud Scheduler → `POST /api/run` | **Azure Functions Timer trigger** → `POST /api/run` (per the client's note) |
 | **BigQuery read** | **Native SA IAM grant (ADC)** | **Stored service-account key**, held in **Key Vault**, read into `GOOGLE_SERVICE_ACCOUNT_JSON` at container start — no cross-cloud identity federation, per the client's own proposal |
 | Auth / SSO | Entra SSO deferred (§10) | **Possibly available now** — Entra ID via Pavel's team's tenant (§6) |
-| IaC | Terraform (`google` provider) | Terraform (**`azurerm`** provider) |
+| IaC | Terraform (`google` provider) | Terraform (**`azurerm`** provider) — `infra/terraform-azure/` |
 
 Every row is a like-for-like swap except BigQuery auth, which trades AWS's federation complexity for a
 simpler-but-longer-lived credential (a key in Key Vault) — see §10 for the rotation trade-off.
@@ -175,8 +176,11 @@ the file.**
       ```hcl
       subscription_id       = "<pavels-team-subscription-id>"
       resource_group        = "wonder-dq-temp"   # or Pavel's team's naming convention
-      region                = "<match Pavel's team's region>"
+      create_resource_group = true               # false = reuse their existing RG
+      location              = "<match Pavel's team's region>"
       image                 = "<registry-name>.azurecr.io/wonder-dq/app:<tag>"
+
+      daily_run_trigger     = "functions"        # or "logicapp" (zero code) — see §7
 
       allow_unauthenticated = true          # NO SSO for this launch, unless §6 resolves before go-live
 
@@ -240,9 +244,15 @@ zero just like Cloud Run, so an in-process timer is unreliable there too).
       intentionally the thinnest possible function — a few lines of code — mirroring how Cloud
       Scheduler/EventBridge Scheduler needed *no* app-side function at all; Azure's timer trigger is the
       one piece that needs a tiny deployable, since Azure has no bare "call this URL on a cron" primitive
-      outside Logic Apps/Functions.
-      > **Alternative:** an Azure **Logic App** with a Recurrence trigger + HTTP action achieves the same
-      > thing with zero code, if the team prefers a no-code trigger over a Functions app.
+      outside Logic Apps/Functions. **Written:** the Function App is provisioned by
+      `infra/terraform-azure/scheduler.tf` and the function itself is
+      `infra/terraform-azure/functions/daily_run/function_app.py` (one timer, one POST, ~40 lines).
+      Terraform can't upload function code, so publish it once after `apply`:
+      `func azure functionapp publish $(terraform output -raw function_app_name) --python`.
+      > **Alternative, also implemented:** set `daily_run_trigger = "logicapp"` for an Azure **Logic
+      > App** (Recurrence trigger + HTTP action) instead — same result with zero code and nothing to
+      > publish, since Terraform declares the whole workflow. `daily_run_trigger = "none"` provisions
+      > no trigger at all.
 - [ ] **7.3** No auth this launch (unless §6 resolves to Entra ID, in which case the Function must send
       whatever token Easy Auth requires — a client-credentials app role is the standard pattern).
 - [ ] **7.4** The console polls `GET /api/runinfo` and shows a refresh banner when the run date advances
@@ -250,24 +260,37 @@ zero just like Cloud Run, so an in-process timer is unreliable there too).
 
 ## 8. Terraform completeness (what `infra/terraform-azure/` must contain)
 
-Not yet written (same status as AWS at this stage). The module needs:
+**Written** in [`infra/terraform-azure/`](../infra/terraform-azure/) (`main.tf`, `scheduler.tf`,
+`variables.tf`, `outputs.tf`, `versions.tf`, `terraform.tfvars.example`, `functions/daily_run/`),
+`terraform validate`-clean against `azurerm` 4.x. Not yet applied — that needs the subscription from §0.
 
-- [ ] **8.1 Resource group** (or reuse Pavel's team's existing one).
-- [ ] **8.2 Azure Container Registry** (`azurerm_container_registry`).
-- [ ] **8.3 Azure Database for PostgreSQL – Flexible Server** + database + firewall rule/private
-      endpoint + admin credentials.
-- [ ] **8.4 Key Vault** + secrets for `APP_DB_URL`, `JIRA_API_TOKEN`, `GOOGLE_SERVICE_ACCOUNT_JSON`
-      (+ access policy or RBAC role assignment granting the Container App's managed identity `get`/`list`).
-- [ ] **8.5 Log Analytics workspace** (required by Container Apps Environment).
-- [ ] **8.6 Container Apps Environment + Container App** — image from ACR, system-assigned managed
-      identity, env vars mirroring the other clouds' container env block (`DATA_SOURCE`, `TICKET_SINK`,
-      `GCP_PROJECT`, `ERP_PROJECT`, `BQ_*`, `JIRA_*`), secrets wired from Key Vault, ingress on port 8000,
-      external ingress enabled (per §5.3).
-- [ ] **8.7 Function App** (Consumption or Premium plan) + storage account (required by Functions) with
-      the Timer-trigger function from §7.
-- [ ] **8.8 Networking** — decide public vs. private Postgres/Container Apps posture (see §10).
+- [x] **8.1 Resource group** — created, or looked up when `create_resource_group = false`.
+- [x] **8.2 Azure Container Registry** (`azurerm_container_registry`, `admin_enabled = false` — pulls
+      go through the managed identity's `AcrPull`, no admin user).
+- [x] **8.3 Azure Database for PostgreSQL – Flexible Server** + database + the "allow Azure services"
+      firewall rule (Container Apps egress IPs aren't stable) + optional admin IP rules. Public access
+      and single-zone for now; private endpoint/HA deferred to §10.
+- [x] **8.4 Key Vault** (RBAC, purge protection off for clean teardown) + secrets `app-db-url`,
+      `jira-api-token`, `bq-service-account-json`, and a `Key Vault Secrets User` role assignment for
+      the app identity (plus `Secrets Officer` for whoever runs `apply`, since Terraform writes them).
+- [x] **8.5 Log Analytics workspace** — created unless `container_app_environment_id` supplies the
+      client's shared environment (§1.5).
+- [x] **8.6 Container Apps Environment + Container App** — image from ACR, all the env vars from the
+      other clouds' container block plus `SCHEDULER_ENABLED=false`, the three secrets wired from Key
+      Vault by *versionless* ID (so rotation needs no Terraform change), ingress on 8000, external.
+      **Departure:** a **user-assigned** managed identity, not system-assigned. The ACR pull and the
+      Key Vault secret references must be authorized *before* the app is created, and a
+      system-assigned principal doesn't exist until *after* — user-assigned breaks that cycle at the
+      same least-privilege scope.
+- [x] **8.7 Function App** (Linux Consumption `Y1`) + storage account + the Timer-trigger function
+      from §7 — **or** the Logic App variant, selected by `daily_run_trigger`.
+- [x] **8.8 Networking** — public Postgres + public Container Apps ingress for this launch, with
+      `ingress_allowed_ip_ranges` as the interim narrowing knob; private posture stays in §10. A
+      Terraform `check` block warns if `allow_unauthenticated = false` is set with an empty allowlist
+      (which would look locked down but isn't).
 - [ ] **8.9 Verify auto-close config** against the client's Jira workflow (`JIRA_DONE_TRANSITION`,
-      `JIRA_FINGERPRINT_FIELD`) — runtime verification, identical to GCP §8.4 / AWS §8.8.
+      `JIRA_FINGERPRINT_FIELD` — both now Terraform vars) — runtime verification, identical to
+      GCP §8.4 / AWS §8.8. Still pending: needs the client's real Jira.
 
 ## 9. Migrate off personal / sandbox accounts (before or at go-live)
 
