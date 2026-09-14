@@ -1,5 +1,8 @@
 # Validation Rule SQL — Plain-English Guide
 
+**Last updated: 2026-09-14** — XFER-04 and XFER-07 re-anchored to the delivery date after the
+data-analyst review of the transfer SQL.
+
 > A companion to [`validation-tests.md`](validation-tests.md). That file lists *what* each rule
 > checks; **this file explains the *SQL* behind each rule** — line by line, in plain English, so a
 > non-technical reader can understand exactly what the query does, which tables and columns it
@@ -2751,7 +2754,7 @@ same day, a moderate steady-state rate worth routing to SC Product (IMS) for rec
 
 > **In one sentence:** find Transfer Orders still in an early lifecycle status (not yet shipped,
 > not cancelled) that have had **zero pick activity** more than **Y days** (default 2,
-> **Admin-editable**) after being created.
+> **Admin-editable**) past the **scheduled delivery date** of the lines still awaiting a pick.
 
 ### At a glance
 
@@ -2765,7 +2768,8 @@ same day, a moderate steady-state rate worth routing to SC Product (IMS) for rec
 | **Jira** | Component **Transfers** |
 | **Source tables** | PO Table (population, `order_type='Transfer'`) **⋈** Inventory Ledger (activity check) |
 | **Threshold** | **Y = 2 days**, editable in **Admin → Transfer order aging** (`PUT /api/xfer-aging`, `app_setting.xfer_no_pick_days`) — takes effect on the next validation run, no restart needed. |
-| **Live status** | 🟢 **Live — runs daily.** Added 2026-08-17. Current backlog: **150** (30-day lookback window), a believable ~10/day rate. |
+| **The clock** | `expected_date` (delivery date) of the still-unpicked lines — **not** the order date. `order_date` is the fallback only when the TO carries no `expected_date`. See [Why the clock runs off the delivery date](#why-the-clock-runs-off-the-delivery-date-not-the-order-date). |
+| **Live status** | 🟢 **Live — runs daily.** Added 2026-08-17; re-anchored to the delivery date 2026-09-14 after data-analyst review. Current backlog: **266** (30-day lookback window) — was 497 on the order-date clock, so the change removed 231 not-yet-due flags. |
 
 ### Why "picked" can't be judged from the ledger alone here
 
@@ -2787,20 +2791,54 @@ not a "no pick activity" case, just not a candidate either way. With that filter
 still-early-lifecycle population (statuses like `PENDING`, `PLANNED`, `VENDOR_ACCEPTED`,
 `NOT_RECEIVED`, `EXCEPTION`) with real zero pick activity is a believable ~10/day.
 
+### Why the clock runs off the delivery date, not the order date
+
+Raised in the 2026-09-14 data-analyst review of this SQL: *"some POs have multiple delivery dates,
+need a where clause that filters these, or all later lines will show up once the first lines are
+shipped."*
+
+Two things were checked against live data:
+
+- **Multiple delivery dates per order is real, but rare on transfers.** In a 60-day window, **23 of
+  92,757** transfer orders carry more than one `expected_date` (max 2). It's far more common on
+  **Purchase** POs — **612 of 5,654** (11%, up to 5 dates), which is why `PO-07`/`PO-08` already
+  take `MAX(expected_date)` over their still-open lines. Example transfer: `VDC 5452`, wave 1 due
+  2026-08-30 (cancelled), wave 2 due **2026-09-15** (`PENDING`, 896 units, nothing shipped).
+- **The underlying defect — clocking from creation instead of delivery — was much bigger than the
+  multi-date case.** Transfers are normally delivered the day after they're cut (`expected_date =
+  order_date + 1` for 87,511 of 92,757), but a real tail is scheduled 5–14+ days out. On the
+  order-date clock, **231 of 497** live candidates (46%) were flagged **before their delivery date
+  had even passed** — every one of the 83 `VENDOR_ACCEPTED` orders and 131 of the 185 `PLANNED`
+  ones, some scheduled six weeks out. Nothing *should* have been picked yet.
+
+**The fix:** `due_date` = the **latest** `expected_date` across the lines still awaiting a pick, and
+the rule ages off `COALESCE(due_date, order_date)`. Taking the latest such date is what answers the
+analyst's point directly — once the first delivery wave ships, the later-dated wave governs the
+clock and can't pull the order into the list before its own date arrives. Backlog went 497 → **266**;
+the 231 that dropped out were all not-yet-due.
+
 ### The SQL
 
 #### Catalog SQL (the documented definition)
 
 ```sql
 -- Catalog XFER-04: a Transfer Order still in an early lifecycle status (not yet shipped,
--- not cancelled/rejected) with ZERO Transfer Out ledger activity more than Y days after it
--- was created. A TO is also treated as already-picked if its own status has advanced past
--- picking — see the write-up above. Y defaults to 2, admin-editable.
+-- not cancelled/rejected) with ZERO Transfer Out ledger activity more than Y days past the
+-- scheduled delivery date of its still-unpicked lines. A TO is also treated as already-picked
+-- if its own status has advanced past picking — see the write-up above. Y defaults to 2,
+-- admin-editable.
 WITH to_agg AS (
   SELECT
     po,
     MAX(DATE(po_date_utc))                  AS order_date,
-    ARRAY_AGG(DISTINCT status IGNORE NULLS) AS statuses
+    ARRAY_AGG(DISTINCT status IGNORE NULLS) AS statuses,
+    -- latest delivery date across the lines still awaiting a pick: once the first wave ships,
+    -- the later-dated wave governs the clock instead of dropping in as already-overdue
+    MAX(IF(UPPER(status) NOT IN (
+      'CANCELLED', 'CANCELED', 'VOIDED', 'VENDOR_REJECTED',
+      'SHIPPED', 'PARTIALLY_SHIPPED', 'RECEIVED', 'PARTIALLY_RECEIVED',
+      'CLOSED', 'PICKED', 'PACKED', 'PACKING', 'PLACED'
+    ), expected_date, NULL))                AS due_date
   FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`
   WHERE order_type = 'Transfer'
     AND po IS NOT NULL
@@ -2829,7 +2867,7 @@ WHERE p.po IS NULL
     )
   )
   AND t.order_date IS NOT NULL
-  AND t.order_date < DATE_SUB(CURRENT_DATE(), INTERVAL 2 DAY)
+  AND COALESCE(t.due_date, t.order_date) < DATE_SUB(CURRENT_DATE(), INTERVAL 2 DAY)
 ```
 
 #### Live finder SQL (what runs daily)
@@ -2841,6 +2879,12 @@ WITH to_agg AS (
     po,
     MAX(DATE(po_date_utc))                  AS order_date,
     ARRAY_AGG(DISTINCT status IGNORE NULLS) AS statuses,
+    -- latest delivery date across the lines still awaiting a pick (the aging baseline)
+    MAX(IF(UPPER(status) NOT IN (
+      'CANCELLED', 'CANCELED', 'VOIDED', 'VENDOR_REJECTED',
+      'SHIPPED', 'PARTIALLY_SHIPPED', 'RECEIVED', 'PARTIALLY_RECEIVED',
+      'CLOSED', 'PICKED', 'PACKED', 'PACKING', 'PLACED'
+    ), expected_date, NULL))                AS due_date,
     ANY_VALUE(destination_name)             AS facility,
     ANY_VALUE(destination_id)               AS facility_id,
     ANY_VALUE(po_source_system)             AS system
@@ -2862,8 +2906,12 @@ picked AS (   -- transfer orders with at least one real ledger Transfer Out row
 flagged AS (
   SELECT
     t.*,
-    DATE_ADD(t.order_date, INTERVAL @no_pick_days DAY) AS breach_date,
-    DATE_DIFF(@run_date, t.order_date, DAY)            AS days_since_order
+    COALESCE(t.due_date, t.order_date)                       AS aging_from,
+    DATE_ADD(COALESCE(t.due_date, t.order_date),
+             INTERVAL @no_pick_days DAY)                     AS breach_date,
+    DATE_DIFF(@run_date, t.order_date, DAY)                  AS days_since_order,
+    DATE_DIFF(@run_date, COALESCE(t.due_date, t.order_date),
+              DAY)                                           AS days_since_due
   FROM to_agg t
   LEFT JOIN picked p USING (po)
   WHERE p.po IS NULL
@@ -2876,7 +2924,8 @@ flagged AS (
       )
     )
     AND t.order_date IS NOT NULL
-    AND t.order_date < DATE_SUB(@run_date, INTERVAL @no_pick_days DAY)
+    -- aged off the delivery date; order_date only when the TO carries no expected_date
+    AND COALESCE(t.due_date, t.order_date) < DATE_SUB(@run_date, INTERVAL @no_pick_days DAY)
     AND t.order_date >= DATE_SUB(@run_date, INTERVAL 30 DAY)
 ),
 
@@ -2884,27 +2933,29 @@ ranked AS (
   SELECT
     *,
     COUNT(*)     OVER ()                          AS total_matches,
-    ROW_NUMBER() OVER (ORDER BY order_date ASC)    AS rn
+    ROW_NUMBER() OVER (ORDER BY aging_from ASC)    AS rn
   FROM flagged
 )
 
 SELECT * EXCEPT (rn)
 FROM ranked
 WHERE rn <= 500
-ORDER BY order_date ASC
+ORDER BY aging_from ASC
 ```
 
 ### Plain-English walkthrough
 
-1. **`to_agg`** — every Transfer Order, one row per `po`, with its most recent creation date and
-   the full set of distinct statuses seen across its lines.
+1. **`to_agg`** — every Transfer Order, one row per `po`, with its most recent creation date, the
+   full set of distinct statuses seen across its lines, and `due_date`: the **latest**
+   `expected_date` among the lines still awaiting a pick.
 2. **`picked`** — the set of transfer-order ids with at least one real ledger Transfer Out row.
 3. **`flagged`** — `LEFT JOIN … WHERE p.po IS NULL` (no ledger pick), **and** none of the order's
-   statuses fall in the "already advanced or dead" list, **and** it's old enough
-   (`order_date < run_date - Y days`) and recent enough to matter (`order_date >= run_date - 30
-   days`, so the rule stays on the current backlog rather than the full historical population).
-4. **`ranked` + final line** — count, cap at 500, oldest-first (the longest-waiting orders surface
-   first, same convention as PO-07).
+   statuses fall in the "already advanced or dead" list, **and** the delivery date has passed by
+   the threshold (`COALESCE(due_date, order_date) < run_date - Y days` — so an order scheduled for
+   next week isn't flagged today), **and** it's recent enough to matter (`order_date >= run_date -
+   30 days`, so the rule stays on the current backlog rather than the full historical population).
+4. **`ranked` + final line** — count, cap at 500, oldest-**due** first (the longest-overdue orders
+   surface first, same convention as PO-07).
 
 State-based, like PO-07/PO-08: this returns the **current** backlog each run, not just "new
 today" — dedup on the app side prevents re-tickets, and the recheck auto-closes once a pick
@@ -2918,31 +2969,43 @@ appears or the status advances.
 | Column (table) | Plain meaning | Role in this rule |
 |---|---|---|
 | `po` (PO table) | The transfer order id. | Grain of the check; join key against the ledger. |
-| `po_date_utc` (PO table) | When the order was created. | **The clock** — `order_date`, the aging baseline. |
-| `status` (PO table) | The order's lifecycle status. | **The safety filter** — excludes dead and already-advanced orders (see write-up above). |
+| `expected_date` (PO table) | The line's scheduled delivery date. | **The clock** — `due_date`, the latest delivery date across the still-unpicked lines, is the aging baseline. |
+| `po_date_utc` (PO table) | When the order was created. | Fallback clock when the TO carries no `expected_date`; also the 30-day recency window. |
+| `status` (PO table) | The order's lifecycle status. | **The safety filter** — excludes dead and already-advanced orders (see write-up above), and picks which lines `due_date` is measured over. |
 | `ref_order_type`, `l2_action`, `ref_order_id` (ledger) | Movement type and the order it references. | **The check** — `ref_order_type='Transfer Order'`, `l2_action='Transfer Out'`; absence = no pick. |
 
 ### Example of a flagged record (from live data)
 
-Live BigQuery, run date 2026-08-16:
+Live BigQuery, run date 2026-09-14:
 
 | Field | Value |
 |---|---|
-| `transfer_order` | `PO-390835` |
+| `transfer_order` | `PO-445621` |
 | `facility` | Arcadia |
+| `system` | POMS |
 | `to_status` | `NOT_RECEIVED` |
-| `order_date` | 2026-07-17 |
-| `days_since_order` | 30 |
+| `order_date` | 2026-08-19 |
+| `expected_date` | 2026-08-20 |
+| `days_since_order` | 26 |
+| `days_since_expected` | 25 |
+| `breached_at` | 2026-08-22 |
 
-**Why it's flagged:** created 30 days ago, still in an early (`NOT_RECEIVED`) status, and no
-Transfer Out ledger row has ever been recorded against it — well past the 2-day threshold.
+**Why it's flagged:** due for delivery on 2026-08-20, still in an early (`NOT_RECEIVED`) status
+25 days later, and no Transfer Out ledger row has ever been recorded against it — well past the
+2-day threshold. The breach date is delivery date + 2.
+
+**And one that is no longer flagged:** a `VENDOR_ACCEPTED` transfer order created 2026-09-05 and
+scheduled for delivery 2026-10-29. On the old order-date clock it was flagged on 2026-09-08 for
+"no pick activity"; nothing is supposed to be picked for another six weeks. 231 of the 497
+candidates on 2026-09-14 were of this kind.
 
 ---
 
 ## XFER-07 · Transfer Picked — Not Received
 
 > **In one sentence:** find real Transfer Orders that **were** picked but have had **zero
-> receiving activity** more than **Z days** (default 2, **Admin-editable**) after the first pick.
+> receiving activity** more than **Z days** (default 2, **Admin-editable**) after the receipt was
+> **due** — the later of the first pick and the scheduled delivery date of the unreceived lines.
 
 ### At a glance
 
@@ -2956,7 +3019,25 @@ Transfer Out ledger row has ever been recorded against it — well past the 2-da
 | **Jira** | Component **Transfers** |
 | **Source tables** | Inventory Ledger (pick + receipt activity) **⋈** PO Table (existence + status check) |
 | **Threshold** | **Z = 2 days**, editable in **Admin → Transfer order aging** (`PUT /api/xfer-aging`, `app_setting.xfer_not_received_days`). |
-| **Live status** | 🟢 **Live — runs daily.** Added 2026-08-17. Current backlog: **0** — a clean safety net, same shape as PO-13 (kept live even at zero so it catches it the moment it happens). |
+| **The clock** | `GREATEST(first_pick, due_date)` — the later of the first pick and the latest `expected_date` across the lines with nothing received. Falls back to `first_pick` alone when there's no `expected_date`. |
+| **Live status** | 🟢 **Live — runs daily.** Added 2026-08-17 (backlog was 0 then); delivery-date gate added 2026-09-14 after data-analyst review. Current backlog: **58** (30-day lookback) — 61 on the pick-only clock, so the gate held back 3 not-yet-due orders. |
+
+### Why the delivery date gates this one too
+
+The same 2026-09-14 analyst note that re-anchored XFER-04 applies here: *"some POs have multiple
+delivery dates, need a where clause that filters these, or all later lines will show up once the
+first lines are shipped."* Two guards come out of it:
+
+- **Picked early.** `first_pick` alone starts the receipt clock the moment anything is picked, even
+  when delivery isn't scheduled for another week. Using `GREATEST(first_pick, due_date)` holds the
+  clock until the receipt is genuinely due (3 of today's 61 candidates).
+- **Multiple delivery dates.** `due_date` is measured over the lines with **nothing received**
+  (`received_qty <= 0`) and takes the **latest** such date, so a later-dated delivery wave keeps
+  the order out of the list until its own date passes rather than arriving already-overdue.
+
+Rare on transfers today (23 of 92,757 orders carry more than one `expected_date`) — see the
+[XFER-04 write-up](#why-the-clock-runs-off-the-delivery-date-not-the-order-date) for the full data
+profile, including why this is much more common on Purchase POs.
 
 ### Why this one doesn't need the same status-based safety net as XFER-04
 
@@ -2975,7 +3056,10 @@ the transfer order actually exists (so this doesn't double-ticket XFER-01's job)
 ```sql
 -- Catalog XFER-07: a real Transfer Order (exists in the population) that WAS picked (a
 -- Transfer Out ledger row exists) but has no Transfer In / Received ledger row more than Z
--- days after the first pick. Excludes cancelled/voided orders. Z defaults to 2, admin-editable.
+-- days after the receipt was DUE -- the later of the first pick and the latest delivery date
+-- across the lines with nothing received, so an order picked ahead of schedule (or one with a
+-- second later-dated delivery wave) isn't flagged before that date has passed.
+-- Excludes cancelled/voided orders. Z defaults to 2, admin-editable.
 WITH picked AS (
   SELECT
     ref_order_id            AS po,
@@ -2995,10 +3079,12 @@ received AS (   -- transfer orders with at least one Transfer In / Received ledg
     AND ref_order_id IS NOT NULL
 ),
 
-to_exists AS (   -- requires the order to be real (skips XFER-01's territory) + carries status
+to_exists AS (   -- requires the order to be real (skips XFER-01's territory) + status + due date
   SELECT
     po,
-    ARRAY_AGG(DISTINCT status IGNORE NULLS) AS statuses
+    ARRAY_AGG(DISTINCT status IGNORE NULLS) AS statuses,
+    -- latest delivery date across the lines with nothing received yet
+    MAX(IF(COALESCE(received_qty, 0) <= 0, expected_date, NULL)) AS due_date
   FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`
   WHERE order_type = 'Transfer'
   GROUP BY po
@@ -3013,7 +3099,8 @@ WHERE r.po IS NULL
     SELECT 1 FROM UNNEST(e.statuses) s
     WHERE UPPER(s) IN ('CANCELLED', 'CANCELED', 'VOIDED')
   )
-  AND pk.first_pick < DATE_SUB(CURRENT_DATE(), INTERVAL 2 DAY)
+  AND IFNULL(GREATEST(pk.first_pick, e.due_date), pk.first_pick)
+      < DATE_SUB(CURRENT_DATE(), INTERVAL 2 DAY)
 ```
 
 #### Live finder SQL (what runs daily)
@@ -3041,10 +3128,12 @@ received AS (   -- transfer orders with at least one Transfer In / Received ledg
     AND ref_order_id IS NOT NULL
 ),
 
-to_exists AS (   -- requires the order to be real (skips XFER-01's territory) + carries status
+to_exists AS (   -- requires the order to be real (skips XFER-01's territory) + status + due date
   SELECT
     po,
-    ARRAY_AGG(DISTINCT status IGNORE NULLS) AS statuses
+    ARRAY_AGG(DISTINCT status IGNORE NULLS) AS statuses,
+    -- latest delivery date across the lines with nothing received yet
+    MAX(IF(COALESCE(received_qty, 0) <= 0, expected_date, NULL)) AS due_date
   FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`
   WHERE order_type = 'Transfer'
   GROUP BY po
@@ -3053,8 +3142,11 @@ to_exists AS (   -- requires the order to be real (skips XFER-01's territory) + 
 flagged AS (
   SELECT
     pk.*,
-    DATE_ADD(pk.first_pick, INTERVAL @not_received_days DAY) AS breach_date,
-    DATE_DIFF(@run_date, pk.first_pick, DAY)                 AS days_since_pick
+    e.due_date,
+    IFNULL(GREATEST(pk.first_pick, e.due_date), pk.first_pick) AS aging_from,
+    DATE_ADD(IFNULL(GREATEST(pk.first_pick, e.due_date), pk.first_pick),
+             INTERVAL @not_received_days DAY)                  AS breach_date,
+    DATE_DIFF(@run_date, pk.first_pick, DAY)                   AS days_since_pick
   FROM picked pk
   JOIN to_exists e USING (po)
   LEFT JOIN received r USING (po)
@@ -3063,7 +3155,9 @@ flagged AS (
       SELECT 1 FROM UNNEST(e.statuses) s
       WHERE UPPER(s) IN ('CANCELLED', 'CANCELED', 'VOIDED')
     )
-    AND pk.first_pick < DATE_SUB(@run_date, INTERVAL @not_received_days DAY)
+    -- overdue only once BOTH the pick and the delivery date are Z+ days back
+    AND IFNULL(GREATEST(pk.first_pick, e.due_date), pk.first_pick)
+        < DATE_SUB(@run_date, INTERVAL @not_received_days DAY)
     AND pk.first_pick >= DATE_SUB(@run_date, INTERVAL 30 DAY)
 ),
 
@@ -3071,14 +3165,14 @@ ranked AS (
   SELECT
     *,
     COUNT(*)     OVER ()                        AS total_matches,
-    ROW_NUMBER() OVER (ORDER BY first_pick ASC)  AS rn
+    ROW_NUMBER() OVER (ORDER BY aging_from ASC)  AS rn
   FROM flagged
 )
 
 SELECT * EXCEPT (rn)
 FROM ranked
 WHERE rn <= 500
-ORDER BY first_pick ASC
+ORDER BY aging_from ASC
 ```
 
 ### Plain-English walkthrough
@@ -3088,10 +3182,12 @@ ORDER BY first_pick ASC
 2. **`received`** — the set of transfer-order ids with at least one `Transfer In` / `Received`
    ledger row.
 3. **`to_exists`** — requires the order to be real (skips XFER-01's territory) and carries status
-   for the cancelled-order exclusion.
-4. **`flagged`** — picked, not received, not cancelled, and old enough
-   (`first_pick < run_date - Z days`) / recent enough (`>= run_date - 30 days`) to matter.
-5. **`ranked` + final line** — count, cap at 500, oldest-first.
+   for the cancelled-order exclusion plus `due_date`, the latest delivery date across the lines
+   with nothing received.
+4. **`flagged`** — picked, not received, not cancelled, and overdue against
+   `GREATEST(first_pick, due_date)` (so neither an early pick nor a later-dated delivery wave
+   flags before its time) / recent enough (`first_pick >= run_date - 30 days`) to matter.
+5. **`ranked` + final line** — count, cap at 500, oldest-**due** first.
 
 State-based like XFER-04/PO-07/PO-08 — current backlog each run; recheck auto-closes once a
 receiving-leg ledger row appears.
@@ -3103,16 +3199,32 @@ receiving-leg ledger row appears.
 
 | Column (table) | Plain meaning | Role in this rule |
 |---|---|---|
-| `ref_order_type`, `l2_action='Transfer Out'` (ledger) | The pick leg. | **The clock start** — `first_pick`. |
+| `ref_order_type`, `l2_action='Transfer Out'` (ledger) | The pick leg. | **One half of the clock start** — `first_pick`. |
+| `expected_date`, `received_qty` (PO table) | Scheduled delivery date / what's arrived per line. | **The other half of the clock start** — `due_date` = latest `expected_date` among lines with `received_qty <= 0`; the clock starts at the later of the two. |
 | `ref_order_id` (ledger) | The transfer order. | Join key against `to_exists` and `received`. |
 | `l2_action IN ('Transfer In','Received')` (ledger) | The receiving leg. | **The check** — absence = not received. |
 | `status` (PO table) | The order's lifecycle status. | **Exclusion filter** — drops cancelled/voided. |
 
-### Example
+### Example of a flagged record (from live data)
 
-Currently 0 in the live backlog — see the "why this doesn't need a safety net" note above for the
-0/76,035 validation. When it does fire, the shape is identical to XFER-04's (transfer order,
-facility, days since the triggering event, breach date).
+Live BigQuery, run date 2026-09-14:
+
+| Field | Value |
+|---|---|
+| `transfer_order` | `PO-464636` |
+| `facility` | Martin Brower |
+| `system` | Martin Brower |
+| `first_pick` | 2026-08-31 |
+| `expected_date` | 2026-09-01 |
+| `days_since_pick` | 14 |
+| `breached_at` | 2026-09-03 |
+
+**Why it's flagged:** picked 2026-08-31, due at the destination 2026-09-01, and two weeks later
+there is still no `Transfer In` / `Received` ledger row against it. The breach date is delivery
+date + 2, not pick date + 2 — the clock starts at the later of the two.
+
+The backlog was 0 when the rule went live on 2026-08-17 (see the 0/76,035 note above); the
+Martin Brower cluster showing today is new, and worth raising with Field Ops on its own.
 
 ---
 

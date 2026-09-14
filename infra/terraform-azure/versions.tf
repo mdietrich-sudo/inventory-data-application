@@ -19,7 +19,7 @@ terraform {
   #   resource_group_name  = "wonder-dq-tfstate"
   #   storage_account_name = "wonderdqtfstate"
   #   container_name       = "tfstate"
-  #   key                  = "container-apps.tfstate"
+  #   key                  = "app-service.tfstate"
   #   use_azuread_auth     = true
   # }
 }

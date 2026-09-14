@@ -20,6 +20,113 @@ A living log of the project. **Updated at every step** with what was completed (
 
 ## Completed to date
 
+### 2026-09-14 — Azure hosting switched to App Service; daily-run performance profiled
+
+- **Client request: App Service instead of Container Apps.** Their platform team standardizes on App
+  Service, so `infra/terraform-azure/` was converted. `terraform validate`-clean against `azurerm`
+  4.81; still not applied (needs the subscription from GO-LIVE-AZURE §0).
+  - `azurerm_container_app` + `azurerm_container_app_environment` → **`azurerm_linux_web_app` +
+    `azurerm_service_plan`** (Linux, Web App for Containers).
+  - Container Apps `secret {}` blocks → **App Service Key Vault references**
+    (`@Microsoft.KeyVault(SecretUri=...)` app settings), still by *versionless* URI so rotation needs
+    no Terraform change. Required naming the user-assigned identity in
+    `key_vault_reference_identity_id` — without it App Service resolves references with the
+    non-existent *system*-assigned identity and every secret app setting silently comes back empty.
+  - `ingress { target_port = 8000 }` → `WEBSITES_PORT`; ingress `ip_security_restriction` →
+    `site_config.ip_restriction` + an explicit `ip_restriction_default_action` (only flipped to
+    `Deny` when the allowlist is non-empty, so a misconfig can't lock everyone out) +
+    `scm_use_main_ip_restriction` so Kudu follows the same list.
+  - `min_replicas`/`max_replicas`/`container_cpu`/`container_memory` → `app_service_sku` (default
+    `B1`, validated to reject Free/Shared) + `app_service_worker_count` + `always_on`. **No
+    scale-to-zero on App Service** — the plan is always allocated, which removes the cold-start
+    `alembic upgrade head` but also the idle savings. `container_app_environment_id` is gone.
+  - Added `health_check_path = /api/health` (the dependency-free 200 — deliberately *not*
+    `/api/runinfo`, which hits the DB and would eject the app on a Postgres blip), a diagnostic
+    setting to Log Analytics for container stdout / HTTP / platform logs (App Service doesn't require
+    a workspace the way Container Apps did, and without one the logs are ephemeral), and an
+    `app_outbound_ips` output. Web app names are now suffixed because App Service hostnames are
+    *globally* unique. `var.image` stays one fully-qualified string and is split into
+    registry + `repo:tag` in `locals` (verified against three image shapes; a registry-less value is
+    rejected by a variable validation rather than silently producing `https://nginx:latest`).
+- **⛔ The switch surfaced a deploy blocker (GO-LIVE-AZURE §7.5).** App Service's front end drops any
+  request that sends no response bytes for **~230s and that is not configurable** (Container Apps'
+  ingress timeout was). `POST /api/run` blocks for **~15 min**, so a *successful* run still returns
+  502. Worked around for the nightly trigger only: the timer function now POSTs, treats a gateway
+  timeout as "run started", polls `GET /api/runinfo` until the run date advances, and **never raises
+  on timeout** — a raised invocation can be retried by the host and a retry would start a second
+  concurrent run (duplicate Jira churn is worse than an unconfirmed run). Confirmation is best-effort:
+  Consumption caps `functionTimeout` at 10 min, under the 15 min run. The **Logic App trigger option
+  is unusable** until this is fixed (its HTTP action's sync limit is ~120s, and `azurerm` exposes
+  neither the timeout nor the async-pattern option). The **console button is not worked around** and
+  will error after ~4 min. Real fix: make `/api/run` return a run id immediately and poll
+  `/api/runinfo`.
+- **Profiled the 15-minute run** (user asked whether it grows unboundedly — it does not).
+  - **~90% is serial Jira HTTP.** The 2026-09-13 run (403 findings / 307 new / 175 auto-closed) makes
+    ~307 create POSTs + ~96 recurrence comments + 175×3 for auto-close (`close()` = comment + `GET
+    /transitions` + POST transition) ≈ **930 sequential round-trips** on one un-pooled `httpx.Client`.
+    BigQuery is the minority cost: 18 finders + 18 rechecks fired one at a time, ~2–5s job latency each.
+  - **Not unbounded.** Finders are windowed (`RECEIPT_LOOKBACK_DAYS=30`, XFER 30d) and capped at
+    `RESULT_CAP=500`/rule, so detection is flat regardless of elapsed days. What looked like growth
+    was backlog absorption (new/run: 148 → 285 → 314 → 389 → 307). The one term that *does* grow is
+    the open backlog (1,261 open) — the 18 recheck queries pass the whole open set as `IN UNNEST`
+    array params; `retention.purge_closed` bounds closed tickets only.
+  - Also noted: there is **no run timing instrumentation at all** — `ValidationRun.started_at` and
+    `finished_at` are both `_ts(run_date)`, a deterministic string.
+  - **Deferred optimization list** (agreed: note now, implement later): parallelize the Jira calls
+    with a bounded pool + 429 retry (~10×, 15 min → ~90s); cache the per-issue `GET /transitions`
+    that `close()` repeats for an identical answer (~a third of auto-close cost, nearly free); stop
+    commenting "still reproducing" on every open ticket every run (30 days open = 30 identical
+    comments — noisy *and* slow); fire the 18 finders + 18 rechecks concurrently; scope rechecks to
+    touched entities instead of the whole open set (fixes the growth term).
+
+### 2026-09-14 — XFER-04 / XFER-07 re-anchored to the delivery date (data-analyst review)
+
+- The data analyst reviewed the transfer SQL and flagged both aging rules: *"some POs have multiple
+  delivery dates, need a where clause that filters these, or all later lines will show up once the
+  first lines are shipped."* Checked both halves of that against live BigQuery before changing
+  anything:
+  - **Multiple delivery dates per order is real but rare on transfers** — **23 of 92,757** TOs in a
+    60-day window carry more than one `expected_date` (max 2; e.g. `VDC 5452`, wave 1 due 08-30
+    cancelled, wave 2 due 09-15 still `PENDING` with 896 units unshipped). It's much more common on
+    **Purchase** POs — **612 of 5,654** (11%, up to 5 dates), which is why `PO-07`/`PO-08` already
+    take `MAX(expected_date)` over their open lines.
+  - **The bigger defect the note exposed: both rules clocked off the wrong date.** XFER-04 aged from
+    `po_date_utc` (creation). Transfers normally deliver the next day (87,511 of 92,757 at
+    `order_date + 1`), but a real tail is scheduled 5–14+ days out — so **231 of 497** live
+    candidates (46%) were being flagged **before their delivery date had passed**: all 83
+    `VENDOR_ACCEPTED` and 131 of 185 `PLANNED`, some scheduled six weeks out.
+- **Fix (both rules now age off the delivery date, taking the LATEST relevant one — which is
+  exactly what stops a later-dated wave from surfacing once the first wave ships):**
+  - **XFER-04** — `due_date` = `MAX(expected_date)` across the lines still awaiting a pick; ages off
+    `COALESCE(due_date, order_date)` (order date only when the TO has no `expected_date`), breach
+    date and ordering follow the same anchor. Live: **497 → 266**.
+  - **XFER-07** — `due_date` = `MAX(expected_date)` across the lines with nothing received
+    (`received_qty <= 0`); the clock starts at `GREATEST(first_pick, due_date)`, so neither an
+    early pick nor a later-dated wave flags before its time. Live: **61 → 58**.
+  - Snapshots now carry `expected_date` (+ `days_since_expected` on XFER-04) so the ticket shows
+    which date the clock ran from; `breached_at` is delivery date + threshold, which is what the
+    age/severity math uses.
+- Both new queries executed against live BigQuery (266 / 58 rows, matching the projections) and both
+  catalog SQL blocks dry-run clean. Updated in `bq_finder.py`, `reference.py` (catalog SQL +
+  plain-language descriptions) and `docs/rule-sql-guide.md` (new "why the clock runs off the delivery
+  date" write-ups, refreshed SQL, walkthroughs, column tables and live examples for both rules).
+- **Open for the analyst / Field Ops:** (1) XFER-07 now shows a **58-order Martin Brower cluster**
+  picked but never received (backlog was 0 when the rule went live on 08-17) — new, and worth a look
+  on its own. (2) Both rules are still **PO-grain**: any line advanced past picking suppresses the
+  whole TO (XFER-04), and any receiving row suppresses it (XFER-07). That means a stuck *later* wave
+  on a multi-date order is currently **under**-reported rather than over-reported. Fixing that means
+  re-graining the rules (and their ticket entity keys) to (TO × delivery date) — deferred as it only
+  affects 23 of 92,757 orders and would churn dedup/auto-close; raise with the analyst to confirm
+  that's the right trade.
+
+### 2026-09-10 — Client-facing process documentation for Confluence
+
+- Wrote [`docs/PROCESS-OVERVIEW.md`](docs/PROCESS-OVERVIEW.md) (+ `.docx`) — a **plain-language, one-page process overview** for the client's Confluence space, aimed at business readers (Accounting / Supply Chain / Field Ops) with a short hosting section for the platform team.
+- Covers: why the system exists, the nightly detect → de-dup → route → ticket → remediate → auto-close → measure cycle (with an ASCII flow), Hard vs Soft fails, the Urgent/High/Medium/Low SLA model and the **data-derived clock start**, primary-owner vs current-holder accountability, the five console screens, Jira behaviour (no duplicates, two-way sync, per-ticket auto-close), what the business can change in Admin without a developer, coverage by area, and roles & responsibilities.
+- **Azure is the stated hosting path** throughout (Container Apps · PostgreSQL Flexible Server · Key Vault · ACR · Functions timer · Log Analytics · Terraform), with BigQuery explicitly staying in GCP as read-only source. *(Hosting moved to **App Service** on 2026-09-14 at the client's request — see that entry.)* Entra ID SSO described as the sign-in model (platform-level, no app code).
+- **Appendix A** lists all **18 live rules** with severity, Hard/Soft, and owning team; **Appendix B** is a glossary. Per the user's call, the page describes the **steady state only** — pending decisions (Entra confirmation, cutover date, threshold tuning, key rotation) stay in [`docs/GO-LIVE-AZURE.md`](docs/GO-LIVE-AZURE.md) and are not surfaced to the client page.
+- `.docx` generated with an arm64 pandoc (the vendored `pandoc-3.10.2-x86_64-macOS.pkg` in `app/backend/` is x86-only and won't run on this machine — no Rosetta).
+
 ### 2026-08-17 — TWH-01 drafted (Transfer Warehouse in/out balance) — DOCUMENTED, deliberately NOT live
 - User shared a real 4-row ledger excerpt (origin Transfer Out → DTW Transfer In → DTW Transfer
   Out → destination Transfer In) as the pattern to replicate — this is the long-catalogued

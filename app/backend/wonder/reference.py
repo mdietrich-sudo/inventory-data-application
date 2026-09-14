@@ -374,9 +374,9 @@ ERROR_TYPES = [
     {"type": "RECEIVED_SKU_NOT_ON_TO", "rule": "Received item listed on the Transfer Order", "ruleType": "REFERENTIAL",
      "owner": "SC Product (IMS)", "desc": "An item was received (Transfer In, or Received at Pantry/HDR) against a Transfer Order that exists, but the TO orders none of it. The receiving-side sibling of XFER-02. Joined on ims_sku, exact-or-suffixed (l.ims_sku = p.ims_sku OR l.ims_sku LIKE p.ims_sku||'-%') — a plain match false-positived 15-70% of every HDR selling unit because TO lines for Pantry frozen items carry a '-N' case-multiplier suffix the receiving leg omits. Excludes Digital Transfer Warehouse. (Framework catalog XFER-05.)"},
     {"type": "TRANSFER_NO_PICK_ACTIVITY", "rule": "Transfer order has pick activity within Y days", "ruleType": "AGING",
-     "owner": "Field Ops", "desc": "A Transfer Order still in an early lifecycle status (not shipped, not cancelled/rejected) has zero Transfer Out ledger activity more than Y days (default 2, admin-editable) after it was created. Ledger presence alone isn't reliable — ~94% of TOs with no matching ledger row are already CLOSED/RECEIVED per their own status (a real ledger sync gap) — so a TO also counts as already-picked if its status has advanced past picking. (Framework catalog XFER-04.)"},
+     "owner": "Field Ops", "desc": "A Transfer Order still in an early lifecycle status (not shipped, not cancelled/rejected) has zero Transfer Out ledger activity more than Y days (default 2, admin-editable) past its scheduled delivery date — the latest expected_date across the lines still awaiting a pick, with the order date used only when the TO carries no expected_date. The clock runs off the delivery date rather than creation so a TO ordered today for delivery next week isn't flagged for having nothing picked yet, and so a TO with two delivery dates doesn't surface its later-dated lines the moment the first ones ship. Ledger presence alone isn't reliable — ~94% of TOs with no matching ledger row are already CLOSED/RECEIVED per their own status (a real ledger sync gap) — so a TO also counts as already-picked if its status has advanced past picking. (Framework catalog XFER-04.)"},
     {"type": "TRANSFER_PICKED_NOT_RECEIVED", "rule": "Picked transfer order received within Z days", "ruleType": "AGING",
-     "owner": "Field Ops", "desc": "A real Transfer Order was picked (a Transfer Out ledger row exists) but has no Transfer In / Received ledger row more than Z days (default 2, admin-editable) after the first pick. Excludes cancelled/voided orders. (Framework catalog XFER-07.)"},
+     "owner": "Field Ops", "desc": "A real Transfer Order was picked (a Transfer Out ledger row exists) but has no Transfer In / Received ledger row more than Z days (default 2, admin-editable) after the receipt was due — the later of the first pick and the latest scheduled delivery date across the lines with nothing received. Taking the later of the two keeps a TO picked well ahead of schedule, or one carrying a second later-dated delivery wave, out of the list until that date has actually passed. Excludes cancelled/voided orders. (Framework catalog XFER-07.)"},
     {"type": "WASTE_DAILY_FACILITY", "rule": "Daily facility waste within threshold", "ruleType": "RANGE",
      "owner": "Field Ops", "desc": "A facility's total NET waste $ for a day exceeds its facility-type threshold (small for IKC/HDR selling units, larger for CK/DISH/Production). NET over an editable allowlist of (l1_action, l2_action) movements that count as waste — approved by Pavel and editable in Admin (Add/remove/toggle combos under the Daily Waste rule) — so losses (Lost, Expiration, Damage, Recall, spoilage, cycle-count shrink, …) net against Found / cycle-count recoveries of the same item; valued at standard cost. Two bands: over the High threshold → High, over the Urgent threshold → Urgent. The drawer lists the top loss-contributing SKUs (sorted) — investigation is the team's job. Routed by facility type (HDR → Field Ops/IKC; CK/DISH/PRODUCTION → Field Ops/ProdCo)."},
     {"type": "ADJ_DAILY_FACILITY", "rule": "Daily facility adjustments within threshold", "ruleType": "RANGE",
@@ -720,8 +720,9 @@ RULES = [
      "params": {"days": XFER_NO_PICK_DAYS_DEFAULT},  # admin-editable; live value in app_setting.xfer_no_pick_days
      "expression": (
         "-- Catalog XFER-04: a Transfer Order still in an early lifecycle status (not yet shipped,\n"
-        "-- not cancelled/rejected) with ZERO Transfer Out ledger activity more than Y days after it\n"
-        "-- was created. 'Picked' = a ledger row with ref_order_type='Transfer Order',\n"
+        "-- not cancelled/rejected) with ZERO Transfer Out ledger activity more than Y days past the\n"
+        "-- scheduled delivery date of its still-unpicked lines. 'Picked' = a ledger row with\n"
+        "-- ref_order_type='Transfer Order',\n"
         "-- l2_action='Transfer Out', ref_order_id = this TO's id.\n"
         "-- NOTE: ledger presence alone is NOT reliable here — verified live that ~94% of TOs with zero\n"
         "-- matching ledger rows are already status=CLOSED or RECEIVED (a real ledger sync gap for a\n"
@@ -729,8 +730,17 @@ RULES = [
         "-- if its own status has advanced past picking (SHIPPED/PARTIALLY_SHIPPED/RECEIVED/\n"
         "-- PARTIALLY_RECEIVED/CLOSED/PICKED/PACKED/PACKING/PLACED), and excluded entirely if dead\n"
         "-- (CANCELLED/CANCELED/VOIDED/VENDOR_REJECTED). Y defaults to 2, admin-editable.\n"
+        "-- The aging clock runs off the DELIVERY date, not creation: due_date is the LATEST\n"
+        "-- expected_date across the lines still awaiting a pick, so a TO scheduled for next week\n"
+        "-- isn't flagged today, and a TO carrying multiple delivery dates doesn't surface its\n"
+        "-- later-dated lines once the first ones ship. order_date is the fallback when the TO\n"
+        "-- carries no expected_date at all.\n"
         "WITH to_agg AS (\n"
-        "  SELECT po, MAX(DATE(po_date_utc)) AS order_date, ARRAY_AGG(DISTINCT status IGNORE NULLS) AS statuses\n"
+        "  SELECT po, MAX(DATE(po_date_utc)) AS order_date, ARRAY_AGG(DISTINCT status IGNORE NULLS) AS statuses,\n"
+        "         MAX(IF(UPPER(status) NOT IN\n"
+        "           ('CANCELLED','CANCELED','VOIDED','VENDOR_REJECTED','SHIPPED','PARTIALLY_SHIPPED',\n"
+        "            'RECEIVED','PARTIALLY_RECEIVED','CLOSED','PICKED','PACKED','PACKING','PLACED'),\n"
+        "           expected_date, NULL)) AS due_date\n"
         "  FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders`\n"
         "  WHERE order_type='Transfer' AND po IS NOT NULL AND TRIM(po) <> ''\n"
         "  GROUP BY po),\n"
@@ -742,7 +752,7 @@ RULES = [
         "    ('CANCELLED','CANCELED','VOIDED','VENDOR_REJECTED','SHIPPED','PARTIALLY_SHIPPED',\n"
         "     'RECEIVED','PARTIALLY_RECEIVED','CLOSED','PICKED','PACKED','PACKING','PLACED'))\n"
         "  AND t.order_date IS NOT NULL\n"
-        "  AND t.order_date < DATE_SUB(CURRENT_DATE(), INTERVAL 2 DAY)"
+        "  AND COALESCE(t.due_date, t.order_date) < DATE_SUB(CURRENT_DATE(), INTERVAL 2 DAY)"
      ), "enabled": True},
     {"id": "XFER-07", "name": "Picked transfer order received within Z days", "primitive": "AGING", "error_type": "TRANSFER_PICKED_NOT_RECEIVED",
      "target_table": "consolidated_inventory_ledger ⋈ int_ledger_purchase_orders", "severity": "Medium", "fail_type": "Soft", "owner_group": "Field Ops",
@@ -750,7 +760,10 @@ RULES = [
      "expression": (
         "-- Catalog XFER-07: a real Transfer Order (exists in the population) that WAS picked (a\n"
         "-- Transfer Out ledger row exists) but has no Transfer In / Received ledger row more than Z\n"
-        "-- days after the first pick. Excludes cancelled/voided orders (dead, not stuck). Unlike\n"
+        "-- days after the receipt was DUE -- the later of the first pick and the latest delivery\n"
+        "-- date across the lines with nothing received, so a TO picked ahead of schedule (or one\n"
+        "-- carrying a second later-dated delivery wave) isn't flagged before that date has passed.\n"
+        "-- Excludes cancelled/voided orders (dead, not stuck). Unlike\n"
         "-- XFER-04, ledger-only is reliable here: verified live that 0 of 76,035 picked, non-cancelled\n"
         "-- transfer orders in a 90-day window lack a matching receiving-leg row. Z defaults to 2,\n"
         "-- admin-editable.\n"
@@ -761,12 +774,14 @@ RULES = [
         "  GROUP BY ref_order_id),\n"
         "received AS (SELECT DISTINCT ref_order_id AS po FROM `wonder-dw-prod-brd.inventory.consolidated_inventory_ledger`\n"
         "  WHERE ref_order_type='Transfer Order' AND l2_action IN ('Transfer In','Received') AND ref_order_id IS NOT NULL),\n"
-        "to_exists AS (SELECT po, ARRAY_AGG(DISTINCT status IGNORE NULLS) AS statuses\n"
+        "to_exists AS (SELECT po, ARRAY_AGG(DISTINCT status IGNORE NULLS) AS statuses,\n"
+        "    MAX(IF(COALESCE(received_qty, 0) <= 0, expected_date, NULL)) AS due_date\n"
         "  FROM `wonder-dw-prod-brd.inventory.int_ledger_purchase_orders` WHERE order_type='Transfer' GROUP BY po)\n"
         "SELECT pk.po FROM picked pk JOIN to_exists e USING(po) LEFT JOIN received r USING(po)\n"
         "WHERE r.po IS NULL\n"
         "  AND NOT EXISTS (SELECT 1 FROM UNNEST(e.statuses) s WHERE UPPER(s) IN ('CANCELLED','CANCELED','VOIDED'))\n"
-        "  AND pk.first_pick < DATE_SUB(CURRENT_DATE(), INTERVAL 2 DAY)"
+        "  AND IFNULL(GREATEST(pk.first_pick, e.due_date), pk.first_pick)\n"
+        "      < DATE_SUB(CURRENT_DATE(), INTERVAL 2 DAY)"
      ), "enabled": True},
     {"id": "PO-14", "name": "Received SKU listed on the PO", "primitive": "REFERENTIAL", "error_type": "PO_SKU_NOT_ON_PO",
      "target_table": "consolidated_inventory_ledger ⋈ int_ledger_purchase_orders", "severity": "High", "fail_type": "Hard", "owner_group": "SC Product (IMS)",

@@ -1,6 +1,20 @@
 output "app_url" {
-  description = "Public HTTPS URL of the console (Container App ingress)."
+  description = "Public HTTPS URL of the console (App Service default hostname)."
   value       = local.app_url
+}
+
+output "app_service_name" {
+  description = "App Service (web app) name — for `az webapp log tail`, restarts, and `az webapp config container set`."
+  value       = azurerm_linux_web_app.app.name
+}
+
+output "app_service_plan" {
+  description = "App Service plan hosting the console, and its SKU."
+  value = {
+    name         = azurerm_service_plan.app.name
+    sku          = azurerm_service_plan.app.sku_name
+    worker_count = azurerm_service_plan.app.worker_count
+  }
 }
 
 output "acr_login_server" {
@@ -23,13 +37,18 @@ output "postgres_fqdn" {
   value       = azurerm_postgresql_flexible_server.pg.fqdn
 }
 
+output "app_outbound_ips" {
+  description = "The App Service's outbound IPs. Reaching Postgres does not need these (the allow-azure-services rule covers it), but they're what you'd allowlist on any client-side firewall — e.g. if Jira is IP-restricted. They change when the plan is scaled or the app is moved, so don't hard-depend on them."
+  value       = azurerm_linux_web_app.app.outbound_ip_address_list
+}
+
 output "key_vault_name" {
   description = "Key Vault holding app-db-url, jira-api-token and bq-service-account-json."
   value       = azurerm_key_vault.kv.name
 }
 
 output "runtime_identity" {
-  description = "User-assigned managed identity used by the Container App (ACR pull + Key Vault read)."
+  description = "User-assigned managed identity used by the App Service (ACR pull + Key Vault reference resolution) and the Function App."
   value = {
     name         = azurerm_user_assigned_identity.app.name
     client_id    = azurerm_user_assigned_identity.app.client_id
@@ -37,9 +56,9 @@ output "runtime_identity" {
   }
 }
 
-output "container_app_environment_id" {
-  description = "Container Apps Environment in use (created here, or the one passed in)."
-  value       = local.cae_id
+output "log_analytics_workspace" {
+  description = "Workspace the App Service diagnostic setting writes to (container stdout, HTTP access log, platform log)."
+  value       = azurerm_log_analytics_workspace.law.name
 }
 
 output "daily_run_trigger" {

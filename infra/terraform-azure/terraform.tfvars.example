@@ -22,8 +22,16 @@ allow_unauthenticated = true
 #   { name = "client-vpn", ip_address_range = "203.0.113.0/24" },
 # ]
 
-# Reuse the client's shared Container Apps Environment instead of a dedicated one (§1.5):
-# container_app_environment_id = "/subscriptions/.../managedEnvironments/shared-env"
+# App Service plan sizing (replaces the Container Apps replica/cpu/memory knobs — there is no
+# scale-to-zero on App Service; the plan is always allocated).
+app_service_sku          = "B1"   # P0v3+ for prod: autoscale, slots, VNet integration
+app_service_worker_count = 1      # the daily run is a singleton; scale up, not out
+always_on                = true   # keep resident so `alembic upgrade head` isn't on the hot path
+
+# The nightly trigger POSTs /api/run, which App Service's front end cuts off at ~230s while the
+# run takes ~15 min. The timer function then polls /api/runinfo for this long to confirm, and
+# never fails the invocation (a retry would start a duplicate run). See scheduler.tf.
+# daily_run_poll_budget_seconds = 480
 
 # BigQuery source (read-only; the data stays in GCP — only hosting moves to Azure)
 bq_project      = "wonder-dw-prod-brd"

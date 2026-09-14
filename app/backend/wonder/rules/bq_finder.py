@@ -1218,7 +1218,16 @@ _TO_EXCLUDED_STATUSES = _TO_ALREADY_PICKED_STATUSES + _TO_DEAD_STATUSES
 
 def _build_no_pick_activity_sql(cap: int, no_pick_days: int, lookback_days: int = 30) -> str:
     """XFER-04: a Transfer Order still in an early lifecycle status with ZERO Transfer Out ledger
-    activity more than `no_pick_days` after it was created.
+    activity more than `no_pick_days` after its scheduled delivery date (falling back to the order
+    date when the TO carries no expected_date).
+
+    The clock runs off the DELIVERY date, not creation (analyst review, 2026-09-14): a TO ordered
+    today for delivery next week has legitimately had nothing picked, and clocking from order_date
+    flagged it on day 3. Live check on today's candidates: 231 of 497 (46%) were flagged before
+    their delivery date had even passed — all 83 VENDOR_ACCEPTED and 131 of 185 PLANNED, some
+    scheduled 6 weeks out. `due_date` is the LATEST expected_date across the lines still awaiting a
+    pick, which is also what handles TOs carrying multiple delivery dates (23 of 92,757 live): once
+    the first wave ships, the later-dated wave can't drag the TO into the list before its own date.
 
     Ledger presence alone is NOT reliable: verified live that ~94% of TOs with zero matching
     Transfer-Out rows are already status=CLOSED or RECEIVED — a real gap in what syncs into
@@ -1236,6 +1245,9 @@ def _build_no_pick_activity_sql(cap: int, no_pick_days: int, lookback_days: int 
     return f"""WITH to_agg AS (
   SELECT po, MAX(DATE(po_date_utc)) AS order_date,
          ARRAY_AGG(DISTINCT status IGNORE NULLS) AS statuses,
+         -- latest scheduled delivery date across the lines still awaiting a pick: a TO with a
+         -- second, later-dated delivery wave isn't judged until that wave's date has passed
+         MAX(IF(UPPER(status) NOT IN ({excluded}), expected_date, NULL)) AS due_date,
          ANY_VALUE(destination_name) AS facility, ANY_VALUE(destination_id) AS facility_id,
          ANY_VALUE(po_source_system) AS system
   FROM `{proj}.{dset}.{po}`
@@ -1244,20 +1256,24 @@ def _build_no_pick_activity_sql(cap: int, no_pick_days: int, lookback_days: int 
 picked AS (SELECT DISTINCT ref_order_id AS po FROM `{proj}.{dset}.{led}`
   WHERE ref_order_type='Transfer Order' AND l2_action='Transfer Out' AND ref_order_id IS NOT NULL),
 flagged AS (
-  SELECT t.*, DATE_ADD(t.order_date, INTERVAL {no_pick_days} DAY) AS breach_date,
-         DATE_DIFF(@run_date, t.order_date, DAY) AS days_since_order
+  SELECT t.*, COALESCE(t.due_date, t.order_date) AS aging_from,
+         DATE_ADD(COALESCE(t.due_date, t.order_date), INTERVAL {no_pick_days} DAY) AS breach_date,
+         DATE_DIFF(@run_date, t.order_date, DAY) AS days_since_order,
+         DATE_DIFF(@run_date, COALESCE(t.due_date, t.order_date), DAY) AS days_since_due
   FROM to_agg t LEFT JOIN picked p USING(po)
   WHERE p.po IS NULL
     AND NOT EXISTS (SELECT 1 FROM UNNEST(t.statuses) s WHERE UPPER(s) IN ({excluded}))
     AND t.order_date IS NOT NULL
-    AND t.order_date < DATE_SUB(@run_date, INTERVAL {no_pick_days} DAY){window}),
-ranked AS (SELECT *, COUNT(*) OVER() AS total_matches, ROW_NUMBER() OVER (ORDER BY order_date ASC) AS rn FROM flagged)
-SELECT * EXCEPT(rn) FROM ranked WHERE rn <= {cap} ORDER BY order_date ASC"""
+    -- aged off the delivery date (order date only when the TO carries no expected_date)
+    AND COALESCE(t.due_date, t.order_date) < DATE_SUB(@run_date, INTERVAL {no_pick_days} DAY){window}),
+ranked AS (SELECT *, COUNT(*) OVER() AS total_matches, ROW_NUMBER() OVER (ORDER BY aging_from ASC) AS rn FROM flagged)
+SELECT * EXCEPT(rn) FROM ranked WHERE rn <= {cap} ORDER BY aging_from ASC"""
 
 
 def _no_pick_activity(ds, run_date, backfill=False) -> Tuple[List[Finding], int]:
     """TRANSFER_NO_PICK_ACTIVITY (Medium, Field Ops) — framework XFER-04. Current backlog of
-    still-early-status Transfer Orders with no pick activity `no_pick_days` after creation."""
+    still-early-status Transfer Orders with no pick activity `no_pick_days` past the delivery date
+    of their still-unpicked lines (order date as the fallback when there's no expected_date)."""
     bq = ds._bq
     src = settings.bq_po_table
     cap = BACKFILL_CAP if backfill else RESULT_CAP
@@ -1272,7 +1288,9 @@ def _no_pick_activity(ds, run_date, backfill=False) -> Tuple[List[Finding], int]
             "transfer_order": r.po, "facility": r.facility or "—", "system": r.system,
             "to_status": ", ".join(r.statuses) if r.statuses else None,
             "order_date": r.order_date.isoformat() if r.order_date else None,
-            "days_since_order": r.days_since_order, "no_pick_days_threshold": days,
+            "expected_date": r.due_date.isoformat() if r.due_date else None,
+            "days_since_order": r.days_since_order,
+            "days_since_expected": r.days_since_due, "no_pick_days_threshold": days,
             "breached_at": r.breach_date.isoformat() if r.breach_date else run_date,
         }
         if r.facility_id:
@@ -1306,9 +1324,15 @@ SELECT po FROM picked UNION DISTINCT SELECT po FROM advanced"""
 def _build_picked_not_received_sql(cap: int, not_received_days: int, lookback_days: int = 30) -> str:
     """XFER-07: a real Transfer Order (exists in the population) that WAS picked (a Transfer Out
     ledger row exists) but has no Transfer In / Received ledger row more than `not_received_days`
-    after the first pick. Excludes cancelled/voided orders. Unlike XFER-04, ledger-only is reliable
-    here: verified live that 0 of 76,035 picked, non-cancelled transfer orders in a 90-day window
-    lack a matching receiving-leg row."""
+    after the receipt was due. Excludes cancelled/voided orders. Unlike XFER-04, ledger-only is
+    reliable here: verified live that 0 of 76,035 picked, non-cancelled transfer orders in a 90-day
+    window lack a matching receiving-leg row.
+
+    "Due" = the later of the first pick and the latest scheduled delivery date across the lines with
+    nothing received (analyst review, 2026-09-14): a TO picked early, or one carrying a second
+    later-dated delivery wave, must not be flagged before that wave's delivery date has passed.
+    first_pick alone suppressed 3 of today's 61 candidates prematurely; the multi-delivery-date case
+    is rarer on transfers (23 of 92,757 live) but this is the guard for it."""
     proj, dset = settings.gcp_project, settings.bq_dataset
     led, po = settings.bq_ledger_table, settings.bq_po_table
     window = (f"\n    AND pk.first_pick >= DATE_SUB(@run_date, INTERVAL {lookback_days} DAY)"
@@ -1321,22 +1345,30 @@ def _build_picked_not_received_sql(cap: int, not_received_days: int, lookback_da
   GROUP BY ref_order_id),
 received AS (SELECT DISTINCT ref_order_id AS po FROM `{proj}.{dset}.{led}`
   WHERE ref_order_type='Transfer Order' AND l2_action IN ('Transfer In','Received') AND ref_order_id IS NOT NULL),
-to_exists AS (SELECT po, ARRAY_AGG(DISTINCT status IGNORE NULLS) AS statuses
+to_exists AS (SELECT po, ARRAY_AGG(DISTINCT status IGNORE NULLS) AS statuses,
+    -- latest scheduled delivery date across the lines with nothing received yet
+    MAX(IF(COALESCE(received_qty, 0) <= 0, expected_date, NULL)) AS due_date
   FROM `{proj}.{dset}.{po}` WHERE order_type='Transfer' GROUP BY po),
 flagged AS (
-  SELECT pk.*, DATE_ADD(pk.first_pick, INTERVAL {not_received_days} DAY) AS breach_date,
+  SELECT pk.*, e.due_date,
+         IFNULL(GREATEST(pk.first_pick, e.due_date), pk.first_pick) AS aging_from,
+         DATE_ADD(IFNULL(GREATEST(pk.first_pick, e.due_date), pk.first_pick),
+                  INTERVAL {not_received_days} DAY) AS breach_date,
          DATE_DIFF(@run_date, pk.first_pick, DAY) AS days_since_pick
   FROM picked pk JOIN to_exists e USING(po) LEFT JOIN received r USING(po)
   WHERE r.po IS NULL
     AND NOT EXISTS (SELECT 1 FROM UNNEST(e.statuses) s WHERE UPPER(s) IN ('CANCELLED','CANCELED','VOIDED'))
-    AND pk.first_pick < DATE_SUB(@run_date, INTERVAL {not_received_days} DAY){window}),
-ranked AS (SELECT *, COUNT(*) OVER() AS total_matches, ROW_NUMBER() OVER (ORDER BY first_pick ASC) AS rn FROM flagged)
-SELECT * EXCEPT(rn) FROM ranked WHERE rn <= {cap} ORDER BY first_pick ASC"""
+    -- receipt is only overdue once BOTH the pick and the delivery date are {not_received_days}+ days back
+    AND IFNULL(GREATEST(pk.first_pick, e.due_date), pk.first_pick)
+        < DATE_SUB(@run_date, INTERVAL {not_received_days} DAY){window}),
+ranked AS (SELECT *, COUNT(*) OVER() AS total_matches, ROW_NUMBER() OVER (ORDER BY aging_from ASC) AS rn FROM flagged)
+SELECT * EXCEPT(rn) FROM ranked WHERE rn <= {cap} ORDER BY aging_from ASC"""
 
 
 def _picked_not_received(ds, run_date, backfill=False) -> Tuple[List[Finding], int]:
     """TRANSFER_PICKED_NOT_RECEIVED (Medium, Field Ops) — framework XFER-07. Current backlog of
-    picked Transfer Orders with no receipt `not_received_days` after the first pick."""
+    picked Transfer Orders with no receipt `not_received_days` after it was due (the later of the
+    first pick and the delivery date of the lines with nothing received)."""
     bq = ds._bq
     src = settings.bq_ledger_table
     cap = BACKFILL_CAP if backfill else RESULT_CAP
@@ -1350,6 +1382,7 @@ def _picked_not_received(ds, run_date, backfill=False) -> Tuple[List[Finding], i
         snap = {
             "transfer_order": r.po, "facility": r.facility or "—", "system": r.system or "—",
             "first_pick": r.first_pick.isoformat() if r.first_pick else None,
+            "expected_date": r.due_date.isoformat() if r.due_date else None,
             "days_since_pick": r.days_since_pick, "not_received_days_threshold": days,
             "breached_at": r.breach_date.isoformat() if r.breach_date else run_date,
         }
@@ -1884,11 +1917,13 @@ def doc_sql(rule_id):
                            _build_received_sku_not_on_to_sql(False, lb, cap))
     if rule_id == "XFER-04":
         return _standalone("-- A still-early-status Transfer Order with zero Transfer Out ledger activity\n"
-                           "-- more than Y days after creation (also already-picked-per-status is excluded).\n",
+                           "-- more than Y days past the delivery date of its still-unpicked lines (order\n"
+                           "-- date as fallback; already-picked-per-status is excluded).\n",
                            _build_no_pick_activity_sql(cap, reference.xfer_no_pick_days(), XFER_AGING_LOOKBACK_DAYS))
     if rule_id == "XFER-07":
         return _standalone("-- A picked Transfer Order with no Transfer In / Received ledger row more than\n"
-                           "-- Z days after the first pick.\n",
+                           "-- Z days after the receipt was due (later of the first pick and the delivery\n"
+                           "-- date of the lines with nothing received).\n",
                            _build_picked_not_received_sql(cap, reference.xfer_not_received_days(), XFER_AGING_LOOKBACK_DAYS))
     if rule_id == "WASTE-DAILY":
         return _banded_daily_doc("WASTE_DAILY_FACILITY", _daily_waste_sql(False),

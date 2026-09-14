@@ -11,6 +11,26 @@
 #
 # Both call the same unchanged endpoint. No auth this launch; if §6 resolves to Entra ID, the
 # caller must present a client-credentials token (see the note at the bottom of this file).
+#
+# !! The App Service move (2026-09-14) broke the naive "POST and wait" shape. App Service's front
+# end drops a request that sends no response bytes for ~230s and that is not configurable, while
+# /api/run blocks for ~15 minutes. So the caller ALWAYS sees a 502 even on a successful run.
+#
+#   * "functions" handles it: the function POSTs, treats a gateway timeout as "run started" (it
+#     did — the work continues server-side), then polls GET /api/runinfo to confirm the run date
+#     advanced, and NEVER raises on a timeout. Raising would mark the timer failed and risk a retry
+#     firing a second concurrent run, which is worse than an unconfirmed one. Confirmation is
+#     best-effort: the Consumption plan caps functionTimeout at 10 min, under the current ~15 min
+#     run, so expect "started, not confirmed" in the logs until /api/run goes async.
+#   * "logicapp" CANNOT work around it. The HTTP action has its own ~120s sync limit and azurerm
+#     exposes neither the timeout nor the asynchronous-pattern option, so this shape reports a
+#     failed run every night. Use it only after /api/run returns immediately.
+#
+# The real fix is app-side: /api/run should create the run, return a run id, and let callers poll
+# GET /api/runinfo. Tracked in docs/GO-LIVE-AZURE.md §7.5. App Service also unlocks a cleaner
+# option than either of these — a scheduled **WebJob** in the same plan calls localhost:8000 and
+# never touches the front end, so the 230s limit doesn't apply at all; azurerm has no WebJob
+# resource, so it would be a deploy-time step rather than Terraform.
 
 locals {
   run_uri = "${local.app_url}/api/run"
@@ -75,10 +95,13 @@ resource "azurerm_linux_function_app" "daily_run" {
     FUNCTIONS_WORKER_RUNTIME = "python"
     # Required for the Python v2 programming model used by ./functions/daily_run.
     AzureWebJobsFeatureFlags = "EnableWorkerIndexing"
-    # The function reads both of these; nothing about the schedule is baked into the code.
+    # The function reads these; nothing about the schedule or the URL is baked into the code.
     TARGET_URL         = local.app_url
     DAILY_RUN_SCHEDULE = local.ncrontab
     WEBSITE_TIME_ZONE  = var.scheduler_time_zone
+    # How long to keep polling GET /api/runinfo for confirmation after the POST is cut off by the
+    # App Service front end. Must stay under host.json's functionTimeout (10 min on Consumption).
+    DAILY_RUN_POLL_BUDGET_SECONDS = tostring(var.daily_run_poll_budget_seconds)
   }
 
   lifecycle {
@@ -114,6 +137,8 @@ resource "azurerm_logic_app_trigger_recurrence" "daily" {
   }
 }
 
+# NOTE: see the header — this shape will report a failed run every night while /api/run blocks for
+# ~15 min, because the HTTP action's own sync limit (~120s) is even tighter than App Service's 230s.
 resource "azurerm_logic_app_action_http" "post_run" {
   count        = local.use_logicapp ? 1 : 0
   name         = "post-api-run"
@@ -135,3 +160,10 @@ resource "azurerm_logic_app_action_http" "post_run" {
 #   - logicapp:  add an "Authentication" block of type ManagedServiceIdentity to the HTTP action;
 #   - and add the trigger's principal to var.ingress_allowed_ip_ranges' replacement (Easy Auth
 #     handles the authz, so the IP allowlist can go away).
+# On App Service, Easy Auth is azurerm_linux_web_app_auth_settings_v2 — a native resource, so this
+# is a smaller lift than it was on Container Apps.
+#
+# Either trigger also has to be reachable: when allow_unauthenticated=false the IP allowlist on the
+# App Service applies to the trigger too, and neither Functions-on-Consumption nor Logic Apps have
+# stable outbound IPs. Entra ID Easy Auth (above) is the answer; an IP allowlist and a cron trigger
+# do not compose.
