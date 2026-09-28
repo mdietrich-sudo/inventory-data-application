@@ -1,0 +1,63 @@
+parameters:
+  - name: publishVstsFeedId
+    type: string
+  - name: pathtoProject
+    type: string
+  - name: pathtoPublish
+    type: string
+  - name: pathtoSource
+    type: string
+  - name: artifactName
+    type: string
+    default: application
+  - name: artifactConfigName
+    type: string
+    default: configuration
+  - name: pathtoConfig
+    type: string
+    default: $(Build.ArtifactStagingDirectory)/configuration
+    
+steps:
+  - task: UseDotNet@2
+    displayName: 'Install .NET Core SDK'
+    inputs:
+      version: 8.x
+  - task: DotNetCoreCLI@2
+    displayName: "DotNetCore: Restore"
+    inputs:
+      command: "restore"
+      projects: "**/*.sln"
+      feedsToUse: "select"
+      vstsFeed: ${{ parameters.publishVstsFeedId }}
+  - task: DotNetCoreCLI@2
+    displayName: "DotNetCore: Test"
+    inputs:
+      command: "test"
+      projects: "**/*Tests/*.csproj"
+      workingDirectory: "$(Build.SourcesDirectory)"
+  - task: DotNetCoreCLI@2
+    displayName: "DotNetCore: Publish"
+    inputs:
+      command: "publish"
+      publishWebProjects: false
+      projects: ${{ parameters.pathtoProject }}
+      arguments: "--configuration Release --no-restore --output ${{ parameters.pathtoPublish }}"
+      workingDirectory: "$(Build.SourcesDirectory)"
+  - task: CopyFiles@2
+    displayName: "Copy: Host File"
+    inputs:
+      SourceFolder: ${{ parameters.pathtoSource }}
+      Contents: "host.json"
+      TargetFolder: ${{ parameters.pathtoConfig }}
+  - task: PublishBuildArtifacts@1
+    displayName: "Artifact Publish: Configuration"
+    inputs:
+      PathtoPublish: ${{ parameters.pathtoConfig }}
+      ArtifactName: ${{ parameters.artifactConfigName }}
+      publishLocation: "Container"
+  - task: PublishBuildArtifacts@1
+    displayName: "Artifact Publish: Function"
+    inputs:
+      PathtoPublish: ${{ parameters.pathtoPublish }}
+      ArtifactName: ${{ parameters.artifactName }}
+      publishLocation: "Container"

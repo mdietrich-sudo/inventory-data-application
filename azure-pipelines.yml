@@ -1,0 +1,175 @@
+# Starter pipeline
+# Start with a minimal pipeline that you can customize to build and deploy your code.
+# Add steps that build, run tests, deploy, and more:
+# https://aka.ms/yaml
+name: $(BuildDefinitionName)_$(SourceBranchName)_$(date:yyyyMMdd)$(rev:.r)
+
+trigger: none
+
+variables:
+- name: isReleasesBranch
+  value: $[startsWith(variables['Build.SourceBranchName'], 'release_')]
+
+pool: "Finance Terraform agent pool" ## Agent which will do the job. Do not change
+
+parameters:
+  - name: Develop
+    displayName: 'Deploy Develop'
+    type: boolean
+    default: false
+  - name: QA
+    displayName: 'Deploy QA'
+    type: boolean
+    default: false
+  - name: Production
+    displayName: 'Deploy Production'
+    type: boolean
+    default: false
+
+stages:
+- stage: Build
+  displayName: 'Build'
+  condition: |
+    or
+    (
+      eq(variables['Build.Reason'], 'Manual'),
+      eq(variables['Build.Reason'], 'PullRequest')
+    ) 
+  variables:
+    - group: "Artifact Configurations"
+  jobs:
+    - job:
+      displayName: 'Build'
+      workspace:
+        clean: all
+      steps:
+        - template: /pipeline-templates/build.yml
+          parameters:
+            publishVstsFeedId: $(publishVstsFeedId)
+            pathtoProject: "Inventory.Data.Application/*.csproj"
+            pathtoSource: "$(Build.SourcesDirectory)/Inventory.Data.Application/"
+            pathtoPublish: "$(Build.ArtifactStagingDirectory)/application"
+
+- ${{ if parameters.Develop }}:
+  - stage: Develop
+    displayName: 'Develop'
+    condition: |
+      and(
+        succeeded('Build'),
+        eq(variables['Build.Reason'], 'Manual')
+      )
+    variables:
+      - group: "InvoiceProducer Develop Configuration"
+    jobs:
+      - deployment: 'Deploy'
+        displayName: 'Deploy'
+        environment: 'Develop'
+        workspace:
+          clean: all
+        strategy:
+          runOnce:
+            deploy:  
+              steps:
+                - template: /pipeline-templates/deploy.yml
+                  parameters:
+                    azureSubscription: "Inventory-Data-App-Dev" ## RG name in Azure. Do not change
+                    pathtoArchive: "$(Pipeline.Workspace)/application/Inventory.Data.Application.zip"
+                    applicationName: "func-inventory-data-app-dev"
+
+      - deployment: 'Version'
+        displayName: 'Version'
+        dependsOn: 'Deploy'
+        environment: "Develop"
+        workspace:
+          clean: all
+        strategy:
+          runOnce:
+            deploy:  
+              steps:
+                - template: /pipeline-templates/version.yml
+                  parameters:
+                    azureSubscription: "Inventory-Data-App-Dev" ## RG name in Azure. Do not change
+                    environment: "dev"
+
+- ${{ if parameters.QA }}:
+  - stage: QA
+    displayName: 'QA'
+    condition: |
+      and(
+        succeeded('Build'),
+        eq(variables['Build.Reason'], 'Manual')
+      )
+    variables:
+      - group: "InvoiceProducer QA Configuration"
+    jobs:
+      - deployment: 'Deploy'
+        displayName: 'Deploy'
+        environment: 'QA'
+        workspace:
+          clean: all
+        strategy:
+          runOnce:
+            deploy:  
+              steps:
+                - template: /pipeline-templates/deploy.yml
+                  parameters:
+                    azureSubscription: "Inventory-Data-App-QA" ## RG name in Azure. Do not change
+                    pathtoArchive: "$(Pipeline.Workspace)/application/Inventory.Data.Application.zip"
+                    applicationName: "func-inventory-data-app-qa"
+
+      - deployment: 'Version'
+        displayName: 'Version'
+        dependsOn: 'Deploy'
+        environment: "QA"
+        workspace:
+          clean: all
+        strategy:
+          runOnce:
+            deploy:  
+              steps:
+                - template: /pipeline-templates/version.yml
+                  parameters:
+                    azureSubscription: "Inventory-Data-App-QA" ## RG name in Azure. Do not change
+                    environment: "qa"
+
+- ${{ if parameters.Production }}:
+  - stage: Production
+    displayName: 'Production'
+    dependsOn: 'QA'
+    condition: |
+      and(
+        succeeded('QA'), 
+        eq(variables.isReleasesBranch, 'True')
+      )
+    variables:  
+      - group: "InvoiceProducer Production Configuration"
+    jobs:
+      - deployment: 'Deploy'
+        displayName: 'Deploy'
+        environment: 'Prod'
+        workspace:
+          clean: all
+        strategy:
+          runOnce:
+            deploy:  
+              steps:
+                - template: /pipeline-templates/deploy.yml
+                  parameters:
+                    azureSubscription: "Inventory-Data-App-Prod" ## RG name in Azure. Do not change
+                    pathtoArchive: "$(Pipeline.Workspace)/application/Inventory.Data.Application.zip"
+                    applicationName: "func-inventory-data-app-prod"
+
+      - deployment: 'Version'
+        displayName: 'Version'
+        dependsOn: 'Deploy'
+        environment: "Prod"
+        workspace:
+          clean: all
+        strategy:
+          runOnce:
+            deploy:  
+              steps:
+                - template: /pipeline-templates/version.yml
+                  parameters:
+                    azureSubscription: "Inventory-Data-App-Prod" ## RG name in Azure. Do not change
+                    environment: "prod"

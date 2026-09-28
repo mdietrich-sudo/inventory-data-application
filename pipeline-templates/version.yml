@@ -1,0 +1,27 @@
+parameters:
+  - name: azureSubscription
+    type: string
+  - name: environment
+    type: string
+
+steps:
+  - checkout: self
+  - download: none
+  - task: AzureKeyVault@2
+    displayName: 'AzureKeyVault: Get Secrets'
+    inputs:
+      azureSubscription: '${{ parameters.azureSubscription }}'
+      KeyVaultName: '' # KeyVault Name
+      SecretsFilter: '*'
+      RunAsPreJob: false
+  - task: DownloadSecureFile@1
+    name: VersionFile
+    displayName: "Download: Script"
+    inputs:
+      secureFile: "createOrUpdateComponentVersion.sh"
+  - task: Bash@3
+    displayName: 'Set Component Version'
+    inputs:
+      targetType: inline
+      script: |
+        bash $(VersionFile.secureFilePath) "$(db-address)" "$(db-name)" "$(administrator-login)" "$(administrator-login-password)" MyDatabase $(Build.BuildNumber) $(Build.Repository.Uri) $(Build.BuildId) &
