@@ -59,7 +59,7 @@ stages:
         eq(variables['Build.Reason'], 'Manual')
       )
     variables:
-      - group: "InvoiceProducer Develop Configuration"
+      - group: "InventoryDataApplication Develop Configuration"
     jobs:
       - deployment: 'Deploy'
         displayName: 'Deploy'
@@ -100,7 +100,7 @@ stages:
         eq(variables['Build.Reason'], 'Manual')
       )
     variables:
-      - group: "InvoiceProducer QA Configuration"
+      - group: "InventoryDataApplication QA Configuration"
     jobs:
       - deployment: 'Deploy'
         displayName: 'Deploy'
@@ -142,7 +142,7 @@ stages:
         eq(variables.isReleasesBranch, 'True')
       )
     variables:  
-      - group: "InvoiceProducer Production Configuration"
+      - group: "InventoryDataApplication Production Configuration"
     jobs:
       - deployment: 'Deploy'
         displayName: 'Deploy'
