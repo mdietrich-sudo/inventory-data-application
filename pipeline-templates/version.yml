@@ -1,27 +1,57 @@
 parameters:
   - name: azureSubscription
     type: string
-  - name: environment
+
+  - name: applicationName
+    type: string
+
+  - name: keyVaultName
+    type: string
+
+  - name: environmentName
     type: string
 
 steps:
-  - checkout: self
+  - checkout: none
+
   - download: none
+
   - task: AzureKeyVault@2
-    displayName: 'AzureKeyVault: Get Secrets'
+    displayName: "Azure Key Vault: Get Versioning Secrets"
     inputs:
-      azureSubscription: '${{ parameters.azureSubscription }}'
-      KeyVaultName: '' # KeyVault Name
-      SecretsFilter: '*'
+      azureSubscription: "${{ parameters.azureSubscription }}"
+      KeyVaultName: "${{ parameters.keyVaultName }}"
+      SecretsFilter: "db-address,db-name,administrator-login,administrator-login-password"
       RunAsPreJob: false
+
   - task: DownloadSecureFile@1
     name: VersionFile
-    displayName: "Download: Script"
+    displayName: "Download Version Script"
     inputs:
       secureFile: "createOrUpdateComponentVersion.sh"
+
   - task: Bash@3
-    displayName: 'Set Component Version'
+    displayName: "Set Component Version"
     inputs:
-      targetType: inline
+      targetType: "inline"
+      failOnStderr: false
       script: |
-        bash $(VersionFile.secureFilePath) "$(db-address)" "$(db-name)" "$(administrator-login)" "$(administrator-login-password)" MyDatabase $(Build.BuildNumber) $(Build.Repository.Uri) $(Build.BuildId) &
+        set -euo pipefail
+
+        chmod +x "$(VersionFile.secureFilePath)"
+
+        bash "$(VersionFile.secureFilePath)" \
+          "$(db-address)" \
+          "$(db-name)" \
+          "$(administrator-login)" \
+          "$(administrator-login-password)" \
+          "${{ parameters.applicationName }}" \
+          "$(Build.BuildNumber)" \
+          "$(Build.Repository.Uri)" \
+          "$(Build.BuildId)"
+
+        echo "Component version updated."
+        echo "Application: ${{ parameters.applicationName }}"
+        echo "Environment: ${{ parameters.environmentName }}"
+        echo "Build Number: $(Build.BuildNumber)"
+        echo "Build ID: $(Build.BuildId)"

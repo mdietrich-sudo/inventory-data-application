@@ -1,175 +1,284 @@
-# Starter pipeline
-# Start with a minimal pipeline that you can customize to build and deploy your code.
-# Add steps that build, run tests, deploy, and more:
-# https://aka.ms/yaml
-name: $(BuildDefinitionName)_$(SourceBranchName)_$(date:yyyyMMdd)$(rev:.r)
+name: $(BuildDefinitionName)_$(SourceBranchName)_$(Date:yyyyMMdd)$(Rev:.r)
 
 trigger: none
 
 variables:
-- name: isReleasesBranch
-  value: $[startsWith(variables['Build.SourceBranchName'], 'release_')]
+  - name: isReleaseBranch
+    value: $[startsWith(variables['Build.SourceBranchName'], 'release_')]
 
-pool: "Finance Terraform agent pool" ## Agent which will do the job. Do not change
+pool:
+  name: "Finance Terraform agent pool"
 
 parameters:
   - name: Develop
-    displayName: 'Deploy Develop'
+    displayName: "Deploy Develop"
     type: boolean
     default: false
+
   - name: QA
-    displayName: 'Deploy QA'
+    displayName: "Deploy QA"
     type: boolean
     default: false
+
   - name: Production
-    displayName: 'Deploy Production'
+    displayName: "Deploy Production"
     type: boolean
     default: false
 
 stages:
+
+# ============================================================
+# Build
+# ============================================================
+
 - stage: Build
-  displayName: 'Build'
+  displayName: "Build"
+
   condition: |
-    or
-    (
+    or(
       eq(variables['Build.Reason'], 'Manual'),
       eq(variables['Build.Reason'], 'PullRequest')
-    ) 
+    )
+
   variables:
     - group: "Artifact Configurations"
+
   jobs:
-    - job:
-      displayName: 'Build'
+    - job: Build
+      displayName: "Build Inventory Data Application"
+
       workspace:
         clean: all
+
       steps:
+        - checkout: self
+          clean: true
+          fetchDepth: 0
+
         - template: /pipeline-templates/build.yml
           parameters:
-            publishVstsFeedId: $(publishVstsFeedId)
-            pathtoProject: "Inventory.Data.Application/*.csproj"
-            pathtoSource: "$(Build.SourcesDirectory)/Inventory.Data.Application/"
-            pathtoPublish: "$(Build.ArtifactStagingDirectory)/application"
+            backendSourcePath: "$(Build.SourcesDirectory)/Inventory.Data.Application/app/backend"
+
+            frontendSourcePath: "$(Build.SourcesDirectory)/Inventory.Data.Application/app/frontend-react"
+
+            frontendOutputPath: "$(Build.SourcesDirectory)/Inventory.Data.Application/app/frontend-react/dist"
+
+            applicationSourcePath: "$(Build.SourcesDirectory)/Inventory.Data.Application"
+
+            applicationPublishPath: "$(Build.ArtifactStagingDirectory)/application"
+
+            artifactName: "application"
+
+# ============================================================
+# Develop
+# ============================================================
 
 - ${{ if parameters.Develop }}:
   - stage: Develop
-    displayName: 'Develop'
+    displayName: "Develop"
+    dependsOn: Build
+
     condition: |
       and(
-        succeeded('Build'),
+        succeeded(),
         eq(variables['Build.Reason'], 'Manual')
       )
+
     variables:
+      - group: "Artifact Configurations"
       - group: "InventoryDataApplication Develop Configuration"
+
     jobs:
-      - deployment: 'Deploy'
-        displayName: 'Deploy'
-        environment: 'Develop'
+
+      - deployment: Deploy
+        displayName: "Deploy"
+        environment: "Develop"
+
         workspace:
           clean: all
+
         strategy:
           runOnce:
-            deploy:  
+            deploy:
               steps:
                 - template: /pipeline-templates/deploy.yml
                   parameters:
-                    azureSubscription: "Inventory-Data-App-Dev" ## RG name in Azure. Do not change
-                    pathtoArchive: "$(Pipeline.Workspace)/application/Inventory.Data.Application.zip"
-                    applicationName: "func-inventory-data-app-dev"
+                    azureSubscription: "Inventory-Data-App-Dev"
 
-      - deployment: 'Version'
-        displayName: 'Version'
-        dependsOn: 'Deploy'
+                    applicationName: "app-inventory-data-app-dev"
+
+                    artifactName: "application"
+
+                    applicationDirectory: "$(Pipeline.Workspace)/application"
+
+                    archivePath: "$(Pipeline.Workspace)/inventory-data-application.zip"
+
+                    keyVaultName: "$(KeyVaultName)"
+
+                    startupCommand: "gunicorn --chdir backend --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000 wonder.main:app"
+
+      - deployment: Version
+        displayName: "Version"
+        dependsOn: Deploy
+        condition: succeeded()
         environment: "Develop"
+
         workspace:
           clean: all
+
         strategy:
           runOnce:
-            deploy:  
+            deploy:
               steps:
                 - template: /pipeline-templates/version.yml
                   parameters:
-                    azureSubscription: "Inventory-Data-App-Dev" ## RG name in Azure. Do not change
-                    environment: "dev"
+                    azureSubscription: "Inventory-Data-App-Dev"
+
+                    applicationName: "app-inventory-data-app-dev"
+
+                    keyVaultName: "$(KeyVaultName)"
+
+                    environmentName: "dev"
+
+# ============================================================
+# QA
+# ============================================================
 
 - ${{ if parameters.QA }}:
   - stage: QA
-    displayName: 'QA'
+    displayName: "QA"
+    dependsOn: Build
+
     condition: |
       and(
-        succeeded('Build'),
+        succeeded(),
         eq(variables['Build.Reason'], 'Manual')
       )
+
     variables:
+      - group: "Artifact Configurations"
       - group: "InventoryDataApplication QA Configuration"
+
     jobs:
-      - deployment: 'Deploy'
-        displayName: 'Deploy'
-        environment: 'QA'
+
+      - deployment: Deploy
+        displayName: "Deploy"
+        environment: "QA"
+
         workspace:
           clean: all
+
         strategy:
           runOnce:
-            deploy:  
+            deploy:
               steps:
                 - template: /pipeline-templates/deploy.yml
                   parameters:
-                    azureSubscription: "Inventory-Data-App-QA" ## RG name in Azure. Do not change
-                    pathtoArchive: "$(Pipeline.Workspace)/application/Inventory.Data.Application.zip"
-                    applicationName: "func-inventory-data-app-qa"
+                    azureSubscription: "Inventory-Data-App-QA"
 
-      - deployment: 'Version'
-        displayName: 'Version'
-        dependsOn: 'Deploy'
+                    applicationName: "app-inventory-data-app-qa"
+
+                    artifactName: "application"
+
+                    applicationDirectory: "$(Pipeline.Workspace)/application"
+
+                    archivePath: "$(Pipeline.Workspace)/inventory-data-application.zip"
+
+                    keyVaultName: "$(KeyVaultName)"
+
+                    startupCommand: "gunicorn --chdir backend --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000 wonder.main:app"
+
+      - deployment: Version
+        displayName: "Version"
+        dependsOn: Deploy
+        condition: succeeded()
         environment: "QA"
+
         workspace:
           clean: all
+
         strategy:
           runOnce:
-            deploy:  
+            deploy:
               steps:
                 - template: /pipeline-templates/version.yml
                   parameters:
-                    azureSubscription: "Inventory-Data-App-QA" ## RG name in Azure. Do not change
-                    environment: "qa"
+                    azureSubscription: "Inventory-Data-App-QA"
 
-- ${{ if parameters.Production }}:
+                    applicationName: "app-inventory-data-app-qa"
+
+                    keyVaultName: "$(KeyVaultName)"
+
+                    environmentName: "qa"
+
+# ============================================================
+# Production
+# ============================================================
+
+- ${{ if and(parameters.QA, parameters.Production) }}:
   - stage: Production
-    displayName: 'Production'
-    dependsOn: 'QA'
+    displayName: "Production"
+    dependsOn: QA
+
     condition: |
       and(
-        succeeded('QA'), 
-        eq(variables.isReleasesBranch, 'True')
+        succeeded(),
+        eq(variables['Build.Reason'], 'Manual'),
+        eq(variables['isReleaseBranch'], 'True')
       )
-    variables:  
+
+    variables:
+      - group: "Artifact Configurations"
       - group: "InventoryDataApplication Production Configuration"
+
     jobs:
-      - deployment: 'Deploy'
-        displayName: 'Deploy'
-        environment: 'Prod'
+
+      - deployment: Deploy
+        displayName: "Deploy"
+        environment: "Prod"
+
         workspace:
           clean: all
+
         strategy:
           runOnce:
-            deploy:  
+            deploy:
               steps:
                 - template: /pipeline-templates/deploy.yml
                   parameters:
-                    azureSubscription: "Inventory-Data-App-Prod" ## RG name in Azure. Do not change
-                    pathtoArchive: "$(Pipeline.Workspace)/application/Inventory.Data.Application.zip"
-                    applicationName: "func-inventory-data-app-prod"
+                    azureSubscription: "Inventory-Data-App-Prod"
 
-      - deployment: 'Version'
-        displayName: 'Version'
-        dependsOn: 'Deploy'
+                    applicationName: "app-inventory-data-app-prod"
+
+                    artifactName: "application"
+
+                    applicationDirectory: "$(Pipeline.Workspace)/application"
+
+                    archivePath: "$(Pipeline.Workspace)/inventory-data-application.zip"
+
+                    keyVaultName: "$(KeyVaultName)"
+
+                    startupCommand: "gunicorn --chdir backend --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000 wonder.main:app"
+
+      - deployment: Version
+        displayName: "Version"
+        dependsOn: Deploy
+        condition: succeeded()
         environment: "Prod"
+
         workspace:
           clean: all
+
         strategy:
           runOnce:
-            deploy:  
+            deploy:
               steps:
                 - template: /pipeline-templates/version.yml
                   parameters:
-                    azureSubscription: "Inventory-Data-App-Prod" ## RG name in Azure. Do not change
-                    environment: "prod"
+                    azureSubscription: "Inventory-Data-App-Prod"
+
+                    applicationName: "app-inventory-data-app-prod"
+
+                    keyVaultName: "$(KeyVaultName)"
+
+                    environmentName: "prod"
