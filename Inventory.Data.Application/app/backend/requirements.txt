@@ -1,4 +1,5 @@
 # Wonder Inventory DQ — backend runtime deps (Python 3.11 in prod; runs on 3.9+ locally)
+gunicorn>=21.2
 fastapi>=0.110
 uvicorn[standard]>=0.27
 SQLAlchemy>=2.0

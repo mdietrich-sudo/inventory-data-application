@@ -1,62 +1,263 @@
 parameters:
   - name: azureSubscription
     type: string
+
   - name: applicationName
     type: string
-  - name: pathtoArchive
+
+  - name: artifactName
     type: string
-  - name: pathtoConfig
+    default: "application"
+
+  - name: applicationDirectory
     type: string
-    default: "$(Pipeline.Workspace)/configuration/host.json"
+
+  - name: archivePath
+    type: string
+
+  - name: keyVaultName
+    type: string
+
+  - name: startupCommand
+    type: string
+
 steps:
+  - checkout: none
+
   - download: none
+
+  # ============================================================
+  # Download and validate artifact
+  # ============================================================
   - task: DownloadPipelineArtifact@2
-    displayName: "Download: Artifact"
+    displayName: "Download Application Artifact"
     inputs:
       buildType: "current"
-      targetPath: "$(Pipeline.Workspace)"
-  - task: replacetokens@6
-    displayName: "Replace tokens"
+      artifactName: "${{ parameters.artifactName }}"
+      targetPath: "${{ parameters.applicationDirectory }}"
+
+  - bash: |
+      set -euo pipefail
+
+      APPLICATION_DIRECTORY="${{ parameters.applicationDirectory }}"
+
+      if [ ! -d "$APPLICATION_DIRECTORY" ]; then
+        echo "Application artifact directory was not found: $APPLICATION_DIRECTORY"
+        exit 1
+      fi
+
+      if [ ! -d "$APPLICATION_DIRECTORY/backend" ]; then
+        echo "Backend directory was not found in the downloaded artifact."
+        exit 1
+      fi
+
+      if [ ! -f "$APPLICATION_DIRECTORY/backend/requirements.txt" ]; then
+        echo "requirements.txt was not found in the downloaded artifact."
+        exit 1
+      fi
+
+      if [ ! -d "$APPLICATION_DIRECTORY/backend/wonder" ]; then
+        echo "The backend/wonder Python package was not found."
+        exit 1
+      fi
+
+      if [ ! -f "$APPLICATION_DIRECTORY/backend/wonder/main.py" ]; then
+        echo "The backend/wonder/main.py application entry point was not found."
+        exit 1
+      fi
+
+      if [ ! -d "$APPLICATION_DIRECTORY/backend/static" ]; then
+        echo "The compiled frontend static directory was not found."
+        exit 1
+      fi
+
+      echo "Downloaded application artifact:"
+      find "$APPLICATION_DIRECTORY" \
+        -maxdepth 4 \
+        -type f \
+        | sort \
+        | sed -n '1,200p'
+    displayName: "Validate Application Artifact"
+
+  # ============================================================
+  # Retrieve environment secrets
+  # ============================================================
+  - task: AzureKeyVault@2
+    displayName: "Azure Key Vault: Get Secrets"
     inputs:
-      rootDirectory: "$(Pipeline.Workspace)"
-      targetFiles: "**/*.json"
+      azureSubscription: "${{ parameters.azureSubscription }}"
+      KeyVaultName: "${{ parameters.keyVaultName }}"
+      SecretsFilter: "*"
+      RunAsPreJob: false
+
+  # ============================================================
+  # Replace configuration tokens
+  #
+  # Key Vault must run before this step so its secrets are
+  # available as pipeline variables during token replacement.
+  # ============================================================
+  - task: replacetokens@6
+    displayName: "Replace Configuration Tokens"
+    inputs:
+      rootDirectory: "${{ parameters.applicationDirectory }}"
+      targetFiles: |
+        **/*.json
+        **/*.yaml
+        **/*.yml
       encoding: "auto"
-      writeBOM: true
+      writeBOM: false
       actionOnMissing: "warn"
       keepToken: false
       tokenPrefix: "#{"
       tokenSuffix: "}#"
+
+  # ============================================================
+  # Package application
+  # ============================================================
   - task: ArchiveFiles@2
-    displayName: "Update: Host File"
+    displayName: "Create Application ZIP"
     inputs:
-      rootFolderOrFile: ${{ parameters.pathtoConfig }}
+      rootFolderOrFile: "${{ parameters.applicationDirectory }}"
       includeRootFolder: false
       archiveType: "zip"
-      archiveFile: ${{ parameters.pathtoArchive }}
-      replaceExistingArchive: false
-  - task: AzureKeyVault@2
-    displayName: 'AzureKeyVault: Get Secret'
-    inputs:
-      azureSubscription: '${{ parameters.azureSubscription }}'
-      KeyVaultName: '' # KeyVault Name
-      SecretsFilter: "*"
-      RunAsPreJob: false
-  - task: AzureFunctionApp@1
-    displayName: "Deploy: Azure Function"
+      archiveFile: "${{ parameters.archivePath }}"
+      replaceExistingArchive: true
+
+  - bash: |
+      set -euo pipefail
+
+      ARCHIVE_PATH="${{ parameters.archivePath }}"
+
+      if [ ! -f "$ARCHIVE_PATH" ]; then
+        echo "Application ZIP was not created: $ARCHIVE_PATH"
+        exit 1
+      fi
+
+      echo "Application ZIP created successfully:"
+      ls -lh "$ARCHIVE_PATH"
+    displayName: "Validate Application ZIP"
+
+  # ============================================================
+  # Configure App Service
+  # ============================================================
+  - task: AzureCLI@2
+    displayName: "Configure App Service"
     inputs:
       azureSubscription: "${{ parameters.azureSubscription }}"
-      appType: "functionApp"
-      appName: ${{ parameters.applicationName }}
-      package: ${{ parameters.pathtoArchive }}
-      # List of env vars used by application and stored in KeyVault
+      scriptType: "bash"
+      scriptLocation: "inlineScript"
+      addSpnToEnvironment: false
+      inlineScript: |
+        set -euo pipefail
+
+        APPLICATION_NAME="${{ parameters.applicationName }}"
+        STARTUP_COMMAND="${{ parameters.startupCommand }}"
+
+        echo "Configuring App Service: $APPLICATION_NAME"
+
+        az webapp show \
+          --name "$APPLICATION_NAME" \
+          --query "{name:name,state:state,hostName:defaultHostName}" \
+          --output table
+
+        az webapp config set \
+          --name "$APPLICATION_NAME" \
+          --linux-fx-version "PYTHON|3.11" \
+          --startup-file "$STARTUP_COMMAND" \
+          --output none
+
+        az webapp config appsettings set \
+          --name "$APPLICATION_NAME" \
+          --settings \
+            SCM_DO_BUILD_DURING_DEPLOYMENT="true" \
+            ENABLE_ORYX_BUILD="true" \
+            PYTHONPATH="/home/site/wwwroot/backend" \
+            APPLICATION_VERSION="$(Build.BuildNumber)" \
+            SOURCE_COMMIT="$(Build.SourceVersion)" \
+          --output none
+
+  # ============================================================
+  # Deploy application
+  # ============================================================
+  - task: AzureWebApp@1
+    displayName: "Deploy Inventory Data Application"
+    inputs:
+      azureSubscription: "${{ parameters.azureSubscription }}"
+      appType: "webAppLinux"
+      appName: "${{ parameters.applicationName }}"
+      package: "${{ parameters.archivePath }}"
+      runtimeStack: "PYTHON|3.11"
+      startUpCommand: "${{ parameters.startupCommand }}"
+      deploymentMethod: "zipDeploy"
       appSettings: >
-        -FUNCTIONS_EXTENSION_VERSION "~4"
-        -FUNCTIONS_WORKER_RUNTIME "dotnet-isolated"
-        -MathThreshold "1.0"
-        -AzureADSettings:Instance "https://login.microsoftonline.com/{0}"
-        -AzureADSettings:Tenant "$(AzureADTenant)"
-        -AzureADSettings:ClientId "$(AzureADClientId)"
-        -AzureADSettings:ClientSecret "$(AzureADClientSecret)"
-        -AzureADSettings:ApiScope "$(AzureADApiScope)"
-        -BlobConnection "$(blob-connstring)"
-      deploymentMethod: "auto"
+        -SCM_DO_BUILD_DURING_DEPLOYMENT "true"
+        -ENABLE_ORYX_BUILD "true"
+        -PYTHONPATH "/home/site/wwwroot/backend"
+
+        -APP_ENV "$(APP_ENV)"
+
+        -APP_DB_URL "$(DATABASE-URL)"
+
+        -DATA_SOURCE "bigquery"
+        -TICKET_SINK "jira"
+
+        -GCP_PROJECT "$(BIGQUERY-PROJECT-ID)"
+        -BQ_DATASET "$(BIGQUERY-DATASET)"
+        -BQ_LEDGER_TABLE "$(BIGQUERY-LEDGER-TABLE)"
+        -BQ_PO_TABLE "$(BIGQUERY-PO-TABLE)"
+        -GOOGLE_SERVICE_ACCOUNT_JSON "$(GCP-SERVICE-ACCOUNT-JSON)"
+
+        -JIRA_BASE_URL "$(JIRA-BASE-URL)"
+        -JIRA_EMAIL "$(JIRA-EMAIL)"
+        -JIRA_API_TOKEN "$(JIRA-API-TOKEN)"
+        -JIRA_PROJECT_KEY "$(JIRA-PROJECT-KEY)"
+        -JIRA_ISSUE_TYPE "$(JIRA-ISSUE-TYPE)"
+        -JIRA_FINGERPRINT_FIELD "$(JIRA-FINGERPRINT-FIELD)"
+        -JIRA_DONE_TRANSITION "$(JIRA-DONE-TRANSITION)"
+
+        -ENTRA_CLIENT_ID "$(ENTRA-CLIENT-ID)"
+        -ENTRA_CLIENT_SECRET "$(ENTRA-CLIENT-SECRET)"
+        -ENTRA_TENANT_ID "$(ENTRA-TENANT-ID)"
+
+        -APPLICATION_VERSION "$(Build.BuildNumber)"
+        -SOURCE_COMMIT "$(Build.SourceVersion)"
+
+  # ============================================================
+  # Restart and verify deployment
+  # ============================================================
+  - task: AzureCLI@2
+    displayName: "Verify App Service Deployment"
+    inputs:
+      azureSubscription: "${{ parameters.azureSubscription }}"
+      scriptType: "bash"
+      scriptLocation: "inlineScript"
+      addSpnToEnvironment: false
+      inlineScript: |
+        set -euo pipefail
+
+        APPLICATION_NAME="${{ parameters.applicationName }}"
+
+        echo "Restarting App Service after deployment."
+
+        az webapp restart \
+          --name "$APPLICATION_NAME"
+
+        APP_STATE=$(az webapp show \
+          --name "$APPLICATION_NAME" \
+          --query state \
+          --output tsv)
+
+        HOST_NAME=$(az webapp show \
+          --name "$APPLICATION_NAME" \
+          --query defaultHostName \
+          --output tsv)
+
+        echo "Application state: $APP_STATE"
+        echo "Application URL: https://$HOST_NAME"
+
+        if [ "$APP_STATE" != "Running" ]; then
+          echo "App Service is not running."
+          exit 1
+        fi
+
+        echo "App Service deployment completed and the application is running."

@@ -1,63 +1,161 @@
 parameters:
-  - name: publishVstsFeedId
+  - name: backendSourcePath
     type: string
-  - name: pathtoProject
+
+  - name: frontendSourcePath
     type: string
-  - name: pathtoPublish
+
+  - name: frontendOutputPath
     type: string
-  - name: pathtoSource
+
+  - name: applicationSourcePath
     type: string
+
+  - name: applicationPublishPath
+    type: string
+
   - name: artifactName
     type: string
-    default: application
-  - name: artifactConfigName
-    type: string
-    default: configuration
-  - name: pathtoConfig
-    type: string
-    default: $(Build.ArtifactStagingDirectory)/configuration
-    
+    default: "application"
+
 steps:
-  - task: UseDotNet@2
-    displayName: 'Install .NET Core SDK'
+  - bash: |
+      set -euo pipefail
+
+      echo "Backend source: ${{ parameters.backendSourcePath }}"
+      echo "Frontend source: ${{ parameters.frontendSourcePath }}"
+      echo "Application source: ${{ parameters.applicationSourcePath }}"
+      echo "Publish path: ${{ parameters.applicationPublishPath }}"
+
+      if [ ! -d "${{ parameters.backendSourcePath }}" ]; then
+        echo "Backend source directory was not found."
+        exit 1
+      fi
+
+      if [ ! -d "${{ parameters.frontendSourcePath }}" ]; then
+        echo "Frontend source directory was not found."
+        exit 1
+      fi
+
+      if [ ! -f "${{ parameters.frontendSourcePath }}/package.json" ]; then
+        echo "Frontend package.json was not found."
+        exit 1
+      fi
+
+      if [ ! -f "${{ parameters.backendSourcePath }}/requirements.txt" ]; then
+        echo "Backend requirements.txt was not found."
+        exit 1
+      fi
+    displayName: "Validate Application Structure"
+
+  # ============================================================
+  # Frontend
+  # ============================================================
+  - task: NodeTool@0
+    displayName: "Install Node.js 20"
     inputs:
-      version: 8.x
-  - task: DotNetCoreCLI@2
-    displayName: "DotNetCore: Restore"
+      versionSpec: "20.x"
+
+  - bash: |
+      set -euo pipefail
+
+      cd "${{ parameters.frontendSourcePath }}"
+
+      if [ -f "package-lock.json" ]; then
+        npm ci
+      else
+        echo "package-lock.json was not found. Running npm install."
+        npm install
+      fi
+
+      npm run build
+    displayName: "Build React Frontend"
+
+  - bash: |
+      set -euo pipefail
+
+      cd "${{ parameters.frontendSourcePath }}"
+
+      npm run test --if-present -- --run
+    displayName: "Test React Frontend"
+
+  # ============================================================
+  # Backend
+  # ============================================================
+  - task: UsePythonVersion@0
+    displayName: "Install Python 3.11"
     inputs:
-      command: "restore"
-      projects: "**/*.sln"
-      feedsToUse: "select"
-      vstsFeed: ${{ parameters.publishVstsFeedId }}
-  - task: DotNetCoreCLI@2
-    displayName: "DotNetCore: Test"
+      versionSpec: "3.11"
+      addToPath: true
+
+  - bash: |
+      set -euo pipefail
+
+      python --version
+      python -m pip install --upgrade pip
+
+      python -m pip install \
+        -r "${{ parameters.backendSourcePath }}/requirements.txt"
+
+      python -m pip check
+    displayName: "Validate Python Dependencies"
+
+  - bash: |
+      set -euo pipefail
+
+      cd "$(Build.SourcesDirectory)"
+
+      if find . -type f -name "test_*.py" -print -quit | grep -q .; then
+        python -m pip install pytest
+        python -m pytest
+      else
+        echo "No Python tests were found. Skipping backend tests."
+      fi
+    displayName: "Test FastAPI Backend"
+
+  # ============================================================
+  # Package
+  # ============================================================
+  - bash: |
+      set -euo pipefail
+
+      rm -rf "${{ parameters.applicationPublishPath }}"
+      mkdir -p "${{ parameters.applicationPublishPath }}/backend"
+
+      echo "Copying backend"
+
+      cp -R \
+        "${{ parameters.backendSourcePath }}/." \
+        "${{ parameters.applicationPublishPath }}/backend"
+
+      echo "Copying frontend build"
+
+      mkdir -p \
+        "${{ parameters.applicationPublishPath }}/backend/static"
+
+      cp -R \
+        "${{ parameters.frontendOutputPath }}/." \
+        "${{ parameters.applicationPublishPath }}/backend/static"
+
+    displayName: "Prepare Application Artifact"
+
+  - bash: |
+      set -euo pipefail
+
+      cat > "${{ parameters.applicationPublishPath }}/deployment-metadata.json" <<EOF
+      {
+        "buildId": "$(Build.BuildId)",
+        "buildNumber": "$(Build.BuildNumber)",
+        "repository": "$(Build.Repository.Uri)",
+        "sourceBranch": "$(Build.SourceBranch)",
+        "sourceVersion": "$(Build.SourceVersion)"
+      }
+      EOF
+    displayName: "Create Deployment Metadata"
+
+  - task: PublishPipelineArtifact@1
+    displayName: "Publish Application Artifact"
     inputs:
-      command: "test"
-      projects: "**/*Tests/*.csproj"
-      workingDirectory: "$(Build.SourcesDirectory)"
-  - task: DotNetCoreCLI@2
-    displayName: "DotNetCore: Publish"
-    inputs:
-      command: "publish"
-      publishWebProjects: false
-      projects: ${{ parameters.pathtoProject }}
-      arguments: "--configuration Release --no-restore --output ${{ parameters.pathtoPublish }}"
-      workingDirectory: "$(Build.SourcesDirectory)"
-  - task: CopyFiles@2
-    displayName: "Copy: Host File"
-    inputs:
-      SourceFolder: ${{ parameters.pathtoSource }}
-      Contents: "host.json"
-      TargetFolder: ${{ parameters.pathtoConfig }}
-  - task: PublishBuildArtifacts@1
-    displayName: "Artifact Publish: Configuration"
-    inputs:
-      PathtoPublish: ${{ parameters.pathtoConfig }}
-      ArtifactName: ${{ parameters.artifactConfigName }}
-      publishLocation: "Container"
-  - task: PublishBuildArtifacts@1
-    displayName: "Artifact Publish: Function"
-    inputs:
-      PathtoPublish: ${{ parameters.pathtoPublish }}
-      ArtifactName: ${{ parameters.artifactName }}
-      publishLocation: "Container"
+      targetPath: "${{ parameters.applicationPublishPath }}"
+      artifact: "${{ parameters.artifactName }}"
+      publishLocation: "pipeline"
