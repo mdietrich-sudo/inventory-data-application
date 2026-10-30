@@ -117,7 +117,7 @@ steps:
   - task: ArchiveFiles@2
     displayName: "Create Application ZIP"
     inputs:
-      rootFolderOrFile: "${{ parameters.applicationDirectory }}"
+      rootFolderOrFile: "${{ parameters.applicationDirectory }}/backend"
       includeRootFolder: false
       archiveType: "zip"
       archiveFile: "${{ parameters.archivePath }}"
