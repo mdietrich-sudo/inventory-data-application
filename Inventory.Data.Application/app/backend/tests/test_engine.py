@@ -119,8 +119,14 @@ def test_lifecycle_autoclose_and_idempotent():
                         fail_type=rr["fail_type"], owner_group=rr["owner_group"], expression=rr["expression"],
                         enabled=rr["enabled"]))
         for rr in reference.ROUTING:
-            db.add(RoutingMap(error_type=rr["error_type"], team=rr["team"], assignee=rr["assignee"],
-                              jira_project=rr["jira_project"], jira_component=rr["jira_component"]))
+            db.add(
+                RoutingMap(
+                    error_type=rr["error_type"],
+                    team=rr["team"],
+                    assignee=rr["assignee"],
+                    jira_component=rr["jira_component"]
+                )
+            )
         db.commit()
 
         dates = ["2026-06-01", "2026-06-02", "2026-06-03"]

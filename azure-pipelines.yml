@@ -115,7 +115,7 @@ stages:
 
                     keyVaultName: "$(KeyVaultName)"
 
-                    startupCommand: "gunicorn --chdir backend --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000 wonder.main:app"
+                    startupCommand: "gunicorn --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000 wonder.main:app"
 
       - deployment: Version
         displayName: "Version"
@@ -186,7 +186,7 @@ stages:
 
                     keyVaultName: "$(KeyVaultName)"
 
-                    startupCommand: "gunicorn --chdir backend --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000 wonder.main:app"
+                    startupCommand: "gunicorn --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000 wonder.main:app"
 
       - deployment: Version
         displayName: "Version"
@@ -258,7 +258,7 @@ stages:
 
                     keyVaultName: "$(KeyVaultName)"
 
-                    startupCommand: "gunicorn --chdir backend --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000 wonder.main:app"
+                    startupCommand: "gunicorn --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000 wonder.main:app"
 
       - deployment: Version
         displayName: "Version"
